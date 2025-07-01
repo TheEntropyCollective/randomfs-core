@@ -3,6 +3,7 @@ package randomfs
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -37,10 +38,11 @@ const (
 
 // RandomFS represents the main filesystem instance
 type RandomFS struct {
-	ipfsAPI    string
-	dataDir    string
-	blockCache *BlockCache
-	mutex      sync.RWMutex
+	ipfsAPI         string
+	dataDir         string
+	blockCache      *BlockCache
+	mutex           sync.RWMutex
+	useLocalStorage bool
 
 	// Statistics
 	stats Stats
@@ -105,9 +107,22 @@ func NewRandomFSWithOptions(ipfsAPI string, dataDir string, cacheSize int64, ski
 		return nil, fmt.Errorf("failed to create data directory: %v", err)
 	}
 
+	// Create subdirectories for local storage
+	if skipIPFSTest {
+		blocksDir := filepath.Join(dataDir, "blocks")
+		repsDir := filepath.Join(dataDir, "representations")
+		if err := os.MkdirAll(blocksDir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create blocks directory: %v", err)
+		}
+		if err := os.MkdirAll(repsDir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create representations directory: %v", err)
+		}
+	}
+
 	rfs := &RandomFS{
-		ipfsAPI: ipfsAPI,
-		dataDir: dataDir,
+		ipfsAPI:         ipfsAPI,
+		dataDir:         dataDir,
+		useLocalStorage: skipIPFSTest,
 		blockCache: &BlockCache{
 			blocks:  make(map[string][]byte),
 			maxSize: cacheSize,
@@ -121,7 +136,7 @@ func NewRandomFSWithOptions(ipfsAPI string, dataDir string, cacheSize int64, ski
 		}
 		log.Printf("RandomFS initialized with IPFS at %s, data dir %s", ipfsAPI, dataDir)
 	} else {
-		log.Printf("RandomFS initialized without IPFS, data dir %s", dataDir)
+		log.Printf("RandomFS initialized with local storage, data dir %s", dataDir)
 	}
 
 	return rfs, nil
@@ -184,13 +199,18 @@ func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string)
 		Version:     ProtocolVersion,
 	}
 
-	// Store representation in IPFS
+	// Store representation
 	repData, err := json.Marshal(rep)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal representation: %v", err)
 	}
 
-	repHash, err := rfs.addToIPFS(repData)
+	var repHash string
+	if rfs.useLocalStorage {
+		repHash, err = rfs.addToLocalStorage(repData, "representation")
+	} else {
+		repHash, err = rfs.addToIPFS(repData)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to store representation: %v", err)
 	}
@@ -219,8 +239,14 @@ func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string)
 
 // RetrieveFile retrieves and reconstructs a file from its representation hash
 func (rfs *RandomFS) RetrieveFile(repHash string) ([]byte, *FileRepresentation, error) {
-	// Retrieve representation from IPFS
-	repData, err := rfs.catFromIPFS(repHash)
+	// Retrieve representation
+	var repData []byte
+	var err error
+	if rfs.useLocalStorage {
+		repData, err = rfs.catFromLocalStorage(repHash, "representation")
+	} else {
+		repData, err = rfs.catFromIPFS(repHash)
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to retrieve representation: %v", err)
 	}
@@ -313,7 +339,15 @@ func XORBlocksInPlace(a, b []byte) {
 
 // storeBlock stores a block in IPFS and local cache
 func (rfs *RandomFS) storeBlock(block []byte) (string, error) {
-	hash, err := rfs.addToIPFS(block)
+	var hash string
+	var err error
+
+	if rfs.useLocalStorage {
+		hash, err = rfs.addToLocalStorage(block, "block")
+	} else {
+		hash, err = rfs.addToIPFS(block)
+	}
+
 	if err != nil {
 		return "", err
 	}
@@ -344,8 +378,11 @@ func (rfs *RandomFS) retrieveBlock(hash string) ([]byte, error) {
 	}
 	rfs.blockCache.mutex.RUnlock()
 
-	// Retrieve from IPFS
+	// Retrieve from storage
 	rfs.stats.CacheMisses++
+	if rfs.useLocalStorage {
+		return rfs.catFromLocalStorage(hash, "block")
+	}
 	return rfs.catFromIPFS(hash)
 }
 
@@ -424,6 +461,54 @@ func (rfs *RandomFS) catFromIPFS(hash string) ([]byte, error) {
 	}
 
 	return io.ReadAll(resp.Body)
+}
+
+// addToLocalStorage stores data locally and returns a hash
+func (rfs *RandomFS) addToLocalStorage(data []byte, dataType string) (string, error) {
+	// Generate hash for the data
+	hash := fmt.Sprintf("%x", sha256.Sum256(data))
+
+	// Determine directory based on data type
+	var dir string
+	switch dataType {
+	case "block":
+		dir = filepath.Join(rfs.dataDir, "blocks")
+	case "representation":
+		dir = filepath.Join(rfs.dataDir, "representations")
+	default:
+		dir = filepath.Join(rfs.dataDir, "data")
+	}
+
+	// Write data to file
+	filename := filepath.Join(dir, hash)
+	if err := os.WriteFile(filename, data, 0644); err != nil {
+		return "", fmt.Errorf("failed to write to local storage: %v", err)
+	}
+
+	return hash, nil
+}
+
+// catFromLocalStorage retrieves data from local storage
+func (rfs *RandomFS) catFromLocalStorage(hash string, dataType string) ([]byte, error) {
+	// Determine directory based on data type
+	var dir string
+	switch dataType {
+	case "block":
+		dir = filepath.Join(rfs.dataDir, "blocks")
+	case "representation":
+		dir = filepath.Join(rfs.dataDir, "representations")
+	default:
+		dir = filepath.Join(rfs.dataDir, "data")
+	}
+
+	// Read data from file
+	filename := filepath.Join(dir, hash)
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read from local storage: %v", err)
+	}
+
+	return data, nil
 }
 
 // ParseRandomURL parses a rd:// URL
