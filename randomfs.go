@@ -87,6 +87,16 @@ type RandomURL struct {
 
 // NewRandomFS creates a new RandomFS instance
 func NewRandomFS(ipfsAPI string, dataDir string, cacheSize int64) (*RandomFS, error) {
+	return NewRandomFSWithOptions(ipfsAPI, dataDir, cacheSize, false)
+}
+
+// NewRandomFSWithoutIPFS creates a new RandomFS instance without requiring IPFS
+func NewRandomFSWithoutIPFS(dataDir string, cacheSize int64) (*RandomFS, error) {
+	return NewRandomFSWithOptions("", dataDir, cacheSize, true)
+}
+
+// NewRandomFSWithOptions creates a new RandomFS instance with options
+func NewRandomFSWithOptions(ipfsAPI string, dataDir string, cacheSize int64, skipIPFSTest bool) (*RandomFS, error) {
 	if ipfsAPI == "" {
 		ipfsAPI = DefaultIPFSEndpoint
 	}
@@ -104,12 +114,15 @@ func NewRandomFS(ipfsAPI string, dataDir string, cacheSize int64) (*RandomFS, er
 		},
 	}
 
-	// Test IPFS connection
-	if err := rfs.testIPFSConnection(); err != nil {
-		return nil, fmt.Errorf("failed to connect to IPFS: %v", err)
+	// Test IPFS connection unless skipped
+	if !skipIPFSTest {
+		if err := rfs.testIPFSConnection(); err != nil {
+			return nil, fmt.Errorf("failed to connect to IPFS: %v", err)
+		}
+		log.Printf("RandomFS initialized with IPFS at %s, data dir %s", ipfsAPI, dataDir)
+	} else {
+		log.Printf("RandomFS initialized without IPFS, data dir %s", dataDir)
 	}
-
-	log.Printf("RandomFS initialized with IPFS at %s, data dir %s", ipfsAPI, dataDir)
 
 	return rfs, nil
 }
