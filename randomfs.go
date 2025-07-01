@@ -145,7 +145,7 @@ func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string)
 	blockSize := rfs.selectBlockSize(int64(len(data)))
 
 	// Generate randomized blocks
-	blocks, err := rfs.generateRandomBlocks(data, blockSize)
+	blocks, err := GenerateRandomBlocks(data, blockSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate blocks: %v", err)
 	}
@@ -228,12 +228,12 @@ func (rfs *RandomFS) RetrieveFile(repHash string) ([]byte, *FileRepresentation, 
 		// Apply XOR to de-randomize
 		if i < len(rep.BlockHashes)-1 {
 			// Full block
-			deRandomized := rfs.deRandomizeBlock(blockData, rep.BlockSize)
+			deRandomized := DeRandomizeBlock(blockData, rep.BlockSize)
 			reconstructed.Write(deRandomized)
 		} else {
 			// Last block might be partial
 			remaining := rep.FileSize - int64(reconstructed.Len())
-			deRandomized := rfs.deRandomizeBlock(blockData, int(remaining))
+			deRandomized := DeRandomizeBlock(blockData, int(remaining))
 			reconstructed.Write(deRandomized)
 		}
 	}
@@ -244,8 +244,8 @@ func (rfs *RandomFS) RetrieveFile(repHash string) ([]byte, *FileRepresentation, 
 	return reconstructed.Bytes(), &rep, nil
 }
 
-// generateRandomBlocks creates randomized blocks from file data
-func (rfs *RandomFS) generateRandomBlocks(data []byte, blockSize int) ([][]byte, error) {
+// GenerateRandomBlocks creates randomized blocks from file data using XOR with random bytes.
+func GenerateRandomBlocks(data []byte, blockSize int) ([][]byte, error) {
 	var blocks [][]byte
 
 	for offset := 0; offset < len(data); offset += blockSize {
@@ -263,9 +263,7 @@ func (rfs *RandomFS) generateRandomBlocks(data []byte, blockSize int) ([][]byte,
 		}
 
 		// XOR with actual data to create multi-use block
-		for i := 0; i < len(chunk); i++ {
-			randomBlock[i] ^= chunk[i]
-		}
+		XORBlocksInPlace(randomBlock, chunk)
 
 		blocks = append(blocks, randomBlock)
 	}
@@ -273,13 +271,31 @@ func (rfs *RandomFS) generateRandomBlocks(data []byte, blockSize int) ([][]byte,
 	return blocks, nil
 }
 
-// deRandomizeBlock recovers original data from a randomized block
-func (rfs *RandomFS) deRandomizeBlock(block []byte, dataSize int) []byte {
-	// For this implementation, we're using a simple XOR approach
-	// In a real system, this would involve more complex cryptographic operations
+// DeRandomizeBlock recovers original data from a randomized block (XOR with zeros is identity)
+func DeRandomizeBlock(block []byte, dataSize int) []byte {
 	result := make([]byte, dataSize)
 	copy(result, block[:dataSize])
 	return result
+}
+
+// XORBlocks returns the XOR of two byte slices (up to the length of the shorter slice)
+func XORBlocks(a, b []byte) []byte {
+	minLen := len(a)
+	if len(b) < minLen {
+		minLen = len(b)
+	}
+	out := make([]byte, minLen)
+	for i := 0; i < minLen; i++ {
+		out[i] = a[i] ^ b[i]
+	}
+	return out
+}
+
+// XORBlocksInPlace XORs b into a in place (up to the length of b)
+func XORBlocksInPlace(a, b []byte) {
+	for i := 0; i < len(b) && i < len(a); i++ {
+		a[i] ^= b[i]
+	}
 }
 
 // storeBlock stores a block in IPFS and local cache
