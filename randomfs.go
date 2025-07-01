@@ -67,13 +67,14 @@ type BlockCache struct {
 
 // FileRepresentation contains the metadata needed to reconstruct a file
 type FileRepresentation struct {
-	FileName    string   `json:"filename"`
-	FileSize    int64    `json:"filesize"`
-	BlockHashes []string `json:"block_hashes"`
-	BlockSize   int      `json:"block_size"`
-	Timestamp   int64    `json:"timestamp"`
-	ContentType string   `json:"content_type"`
-	Version     string   `json:"version"`
+	FileName    string     `json:"filename"`
+	FileSize    int64      `json:"filesize"`
+	BlockHashes []string   `json:"block_hashes"`
+	BlockSize   int        `json:"block_size"`
+	Timestamp   int64      `json:"timestamp"`
+	ContentType string     `json:"content_type"`
+	Version     string     `json:"version"`
+	Descriptors [][]string `json:"descriptors"` // OFF System descriptor lists
 }
 
 // RandomURL represents a rd:// URL for file access
@@ -164,7 +165,7 @@ func (rfs *RandomFS) testIPFSConnection() error {
 	return nil
 }
 
-// StoreFile stores a file in the randomized block format
+// StoreFile stores a file in the randomized block format using OFF System algorithm
 func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string) (*RandomURL, error) {
 	rfs.mutex.Lock()
 	defer rfs.mutex.Unlock()
@@ -172,20 +173,44 @@ func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string)
 	// Determine block size based on file size
 	blockSize := rfs.selectBlockSize(int64(len(data)))
 
-	// Generate randomized blocks
+	// Generate randomized blocks using OFF System algorithm
 	blocks, err := GenerateRandomBlocks(data, blockSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate blocks: %v", err)
 	}
 
-	// Store blocks in IPFS and cache
+	// Store blocks and build descriptor lists
 	var blockHashes []string
-	for _, block := range blocks {
-		hash, err := rfs.storeBlock(block)
-		if err != nil {
-			return nil, fmt.Errorf("failed to store block: %v", err)
+	var descriptors [][]string
+	tupleSize := 3
+
+	for i := 0; i < len(blocks); i += tupleSize {
+		// Each tuple contains: [result_block, randomizer1, randomizer2]
+		tuple := blocks[i : i+tupleSize]
+		if len(tuple) < tupleSize {
+			// Pad with random data if needed
+			for len(tuple) < tupleSize {
+				randomBlock := make([]byte, blockSize)
+				if _, err := rand.Read(randomBlock); err != nil {
+					return nil, fmt.Errorf("failed to generate padding: %v", err)
+				}
+				tuple = append(tuple, randomBlock)
+			}
 		}
-		blockHashes = append(blockHashes, hash)
+
+		// Store each block in the tuple
+		tupleHashes := make([]string, tupleSize)
+		for j, block := range tuple {
+			hash, err := rfs.storeBlock(block)
+			if err != nil {
+				return nil, fmt.Errorf("failed to store block: %v", err)
+			}
+			tupleHashes[j] = hash
+			blockHashes = append(blockHashes, hash)
+		}
+
+		// Add descriptor for this tuple
+		descriptors = append(descriptors, tupleHashes)
 	}
 
 	// Create file representation
@@ -197,6 +222,7 @@ func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string)
 		Timestamp:   time.Now().Unix(),
 		ContentType: contentType,
 		Version:     ProtocolVersion,
+		Descriptors: descriptors,
 	}
 
 	// Store representation
@@ -237,7 +263,7 @@ func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string)
 	return randomURL, nil
 }
 
-// RetrieveFile retrieves and reconstructs a file from its representation hash
+// RetrieveFile retrieves and reconstructs a file from its representation hash using OFF System algorithm
 func (rfs *RandomFS) RetrieveFile(repHash string) ([]byte, *FileRepresentation, error) {
 	// Retrieve representation
 	var repData []byte
@@ -256,36 +282,53 @@ func (rfs *RandomFS) RetrieveFile(repHash string) ([]byte, *FileRepresentation, 
 		return nil, nil, fmt.Errorf("failed to unmarshal representation: %v", err)
 	}
 
-	// Retrieve and combine blocks
+	// Retrieve and combine blocks using OFF System algorithm
 	var reconstructed bytes.Buffer
-	for i, blockHash := range rep.BlockHashes {
-		blockData, err := rfs.retrieveBlock(blockHash)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to retrieve block %d: %v", i, err)
+	blockIndex := 0
+
+	for _, descriptor := range rep.Descriptors {
+		// Retrieve all blocks in this descriptor tuple
+		tupleBlocks := make([][]byte, len(descriptor))
+		for i, blockHash := range descriptor {
+			blockData, err := rfs.retrieveBlock(blockHash)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to retrieve block %d: %v", i, err)
+			}
+			tupleBlocks[i] = blockData
 		}
 
-		// Apply XOR to de-randomize
-		if i < len(rep.BlockHashes)-1 {
-			// Full block
-			deRandomized := DeRandomizeBlock(blockData, rep.BlockSize)
-			reconstructed.Write(deRandomized)
-		} else {
-			// Last block might be partial
-			remaining := rep.FileSize - int64(reconstructed.Len())
-			deRandomized := DeRandomizeBlock(blockData, int(remaining))
-			reconstructed.Write(deRandomized)
+		// Perform OFF System reconstruction: s_i = b_1 ⊕ b_2 ⊕ ... ⊕ b_t
+		reconstructedBlock := make([]byte, rep.BlockSize)
+		copy(reconstructedBlock, tupleBlocks[0]) // Start with first block
+
+		// XOR with all other blocks in the tuple
+		for i := 1; i < len(tupleBlocks); i++ {
+			XORBlocksInPlace(reconstructedBlock, tupleBlocks[i])
 		}
+
+		// Determine how much data to write (handle last block)
+		remaining := rep.FileSize - int64(reconstructed.Len())
+		if remaining <= int64(rep.BlockSize) {
+			// Last block - only write the actual data
+			reconstructed.Write(reconstructedBlock[:remaining])
+		} else {
+			// Full block
+			reconstructed.Write(reconstructedBlock)
+		}
+
+		blockIndex++
 	}
 
-	log.Printf("Retrieved file %s (%d bytes) from %d blocks",
-		rep.FileName, rep.FileSize, len(rep.BlockHashes))
+	log.Printf("Retrieved file %s (%d bytes) from %d descriptor tuples",
+		rep.FileName, rep.FileSize, len(rep.Descriptors))
 
 	return reconstructed.Bytes(), &rep, nil
 }
 
-// GenerateRandomBlocks creates randomized blocks from file data using XOR with random bytes.
+// GenerateRandomBlocks creates randomized blocks using the OFF System algorithm
 func GenerateRandomBlocks(data []byte, blockSize int) ([][]byte, error) {
 	var blocks [][]byte
+	tupleSize := 3 // Default tuple size as per OFF System
 
 	for offset := 0; offset < len(data); offset += blockSize {
 		end := offset + blockSize
@@ -295,23 +338,45 @@ func GenerateRandomBlocks(data []byte, blockSize int) ([][]byte, error) {
 
 		chunk := data[offset:end]
 
-		// Create random block of fixed size
-		randomBlock := make([]byte, blockSize)
-		if _, err := rand.Read(randomBlock); err != nil {
-			return nil, fmt.Errorf("failed to generate random data: %v", err)
+		// Pad chunk to full block size if needed
+		paddedChunk := make([]byte, blockSize)
+		copy(paddedChunk, chunk)
+
+		// Select t-1 randomizer blocks from existing cache or generate new ones
+		randomizers := make([][]byte, tupleSize-1)
+		for i := 0; i < tupleSize-1; i++ {
+			// For now, generate new random blocks
+			// In a real implementation, you'd select from existing cache
+			randomBlock := make([]byte, blockSize)
+			if _, err := rand.Read(randomBlock); err != nil {
+				return nil, fmt.Errorf("failed to generate random data: %v", err)
+			}
+			randomizers[i] = randomBlock
 		}
 
-		// XOR with actual data to create multi-use block
-		XORBlocksInPlace(randomBlock, chunk)
+		// Calculate o_i = s_i ⊕ r_1 ⊕ r_2 ⊕ ... ⊕ r_{t-1}
+		result := make([]byte, blockSize)
+		copy(result, paddedChunk)
 
-		blocks = append(blocks, randomBlock)
+		for _, randomizer := range randomizers {
+			XORBlocksInPlace(result, randomizer)
+		}
+
+		// Store the result block
+		blocks = append(blocks, result)
+
+		// Also store the randomizer blocks for reuse
+		blocks = append(blocks, randomizers...)
 	}
 
 	return blocks, nil
 }
 
-// DeRandomizeBlock recovers original data from a randomized block (XOR with zeros is identity)
+// DeRandomizeBlock recovers original data using the OFF System algorithm
+// This function is called for each block in the descriptor set
 func DeRandomizeBlock(block []byte, dataSize int) []byte {
+	// In the OFF System, derandomization happens by XORing all blocks in the tuple
+	// This function is called for each block, but the actual XOR happens in RetrieveFile
 	result := make([]byte, dataSize)
 	copy(result, block[:dataSize])
 	return result
