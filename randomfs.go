@@ -450,7 +450,7 @@ func (rfs *RandomFS) addToIPFS(data []byte) (string, error) {
 
 // catFromIPFS retrieves data from IPFS using HTTP API
 func (rfs *RandomFS) catFromIPFS(hash string) ([]byte, error) {
-	resp, err := http.Get(rfs.ipfsAPI + "/api/v0/cat?arg=" + hash)
+	resp, err := http.Post(rfs.ipfsAPI+"/api/v0/cat?arg="+hash, "application/json", nil)
 	if err != nil {
 		return nil, err
 	}
