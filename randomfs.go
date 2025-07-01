@@ -136,7 +136,7 @@ func (rfs *RandomFS) GetStats() Stats {
 
 // testIPFSConnection tests if IPFS daemon is accessible
 func (rfs *RandomFS) testIPFSConnection() error {
-	resp, err := http.Get(rfs.ipfsAPI + "/api/v0/version")
+	resp, err := http.Post(rfs.ipfsAPI+"/api/v0/version", "application/json", nil)
 	if err != nil {
 		return err
 	}
