@@ -5,11 +5,12 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
 // setupTestFS creates a temporary RandomFS instance for testing
-func setupTestFS(t *testing.T) (*RandomFS, func()) {
+func setupTestFS(t *testing.T) (*RandomFS, string, func()) {
 	// Create a temporary directory for test data
 	tempDir, err := ioutil.TempDir("", "randomfs-test")
 	if err != nil {
@@ -27,12 +28,12 @@ func setupTestFS(t *testing.T) (*RandomFS, func()) {
 		os.RemoveAll(tempDir)
 	}
 
-	return rfs, teardown
+	return rfs, tempDir, teardown
 }
 
 // TestStoreAndRetrieveFile tests basic file storage and retrieval
 func TestStoreAndRetrieveFile(t *testing.T) {
-	rfs, teardown := setupTestFS(t)
+	rfs, _, teardown := setupTestFS(t)
 	defer teardown()
 
 	// Test data
@@ -64,7 +65,7 @@ func TestStoreAndRetrieveFile(t *testing.T) {
 
 // TestEmptyFile tests storing and retrieving an empty file
 func TestEmptyFile(t *testing.T) {
-	rfs, teardown := setupTestFS(t)
+	rfs, _, teardown := setupTestFS(t)
 	defer teardown()
 
 	testData := []byte{}
@@ -87,7 +88,7 @@ func TestEmptyFile(t *testing.T) {
 
 // TestLargeFile tests storing and retrieving a file larger than a single block
 func TestLargeFile(t *testing.T) {
-	rfs, teardown := setupTestFS(t)
+	rfs, _, teardown := setupTestFS(t)
 	defer teardown()
 
 	// Create large test data (e.g., 2.5 MB)
@@ -114,7 +115,7 @@ func TestLargeFile(t *testing.T) {
 
 // TestStreamingReader tests reading a file using the streaming API
 func TestStreamingReader(t *testing.T) {
-	rfs, teardown := setupTestFS(t)
+	rfs, _, teardown := setupTestFS(t)
 	defer teardown()
 
 	// Create large test data
@@ -151,7 +152,7 @@ func TestStreamingReader(t *testing.T) {
 
 // TestSmartCache tests the functionality of the multi-tier smart cache.
 func TestSmartCache(t *testing.T) {
-	rfs, teardown := setupTestFS(t)
+	rfs, _, teardown := setupTestFS(t)
 	defer teardown()
 
 	// 1. Store a file to populate the cache.
@@ -212,4 +213,44 @@ func TestSmartCache(t *testing.T) {
 	if rfs.blockCache.warm.Contains(blockHash) {
 		t.Error("Block should be removed from warm cache after promotion.")
 	}
+}
+
+// TestRedundancyRecovery tests the file recovery using redundant blocks.
+func TestRedundancyRecovery(t *testing.T) {
+	rfs, tempDir, teardown := setupTestFS(t)
+	defer teardown()
+
+	rfs.RedundancyFactor = 2
+	testData := []byte("This file will test the redundancy recovery.")
+	url, err := rfs.StoreFile("recovery_test.txt", testData, "text/plain")
+	if err != nil {
+		t.Fatalf("StoreFile failed: %v", err)
+	}
+
+	rep, err := rfs.getRepresentation(url.RepHash)
+	if err != nil {
+		t.Fatalf("getRepresentation failed: %v", err)
+	}
+
+	// Corrupt the primary descriptor by deleting one of its blocks.
+	if len(rep.Descriptors) == 0 || len(rep.Descriptors[0]) == 0 || len(rep.Descriptors[0][0]) == 0 {
+		t.Fatal("Not enough descriptors to run the test.")
+	}
+	blockToCorrupt := rep.Descriptors[0][0][0] // Hash of the first block of the primary tuple.
+
+	blockPath := filepath.Join(tempDir, "blocks", blockToCorrupt)
+	if err := os.Remove(blockPath); err != nil {
+		t.Fatalf("Failed to delete block file for corruption: %v", err)
+	}
+
+	// Now, try to retrieve the file. It should succeed by using the redundant descriptor.
+	retrievedData, _, err := rfs.RetrieveFile(url.RepHash)
+	if err != nil {
+		t.Fatalf("RetrieveFile failed during recovery: %v", err)
+	}
+
+	if !bytes.Equal(testData, retrievedData) {
+		t.Fatal("Recovered data does not match original data.")
+	}
+	t.Logf("Successfully recovered file using redundant descriptor.")
 }

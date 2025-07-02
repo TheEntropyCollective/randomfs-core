@@ -31,7 +31,7 @@ const (
 	MiniThreshold = 10 * 1024 * 1024 // 10MB
 
 	// Protocol version
-	ProtocolVersion = "v4"
+	ProtocolVersion = "v5"
 
 	// Default IPFS API endpoint
 	DefaultIPFSEndpoint = "http://localhost:5001"
@@ -43,11 +43,12 @@ const (
 
 // RandomFS represents the main filesystem instance
 type RandomFS struct {
-	ipfsAPI         string
-	dataDir         string
-	blockCache      *SmartBlockCache
-	mutex           sync.RWMutex
-	useLocalStorage bool
+	ipfsAPI          string
+	dataDir          string
+	blockCache       *SmartBlockCache
+	mutex            sync.RWMutex
+	useLocalStorage  bool
+	RedundancyFactor int
 
 	// Statistics
 	stats Stats
@@ -151,14 +152,14 @@ func (sbc *SmartBlockCache) shouldPromote(hash string) bool {
 
 // FileRepresentation contains the metadata needed to reconstruct a file
 type FileRepresentation struct {
-	FileName    string     `json:"filename"`
-	FileSize    int64      `json:"filesize"`
-	BlockHashes []string   `json:"block_hashes"`
-	BlockSize   int        `json:"block_size"`
-	Timestamp   int64      `json:"timestamp"`
-	ContentType string     `json:"content_type"`
-	Version     string     `json:"version"`
-	Descriptors [][]string `json:"descriptors"` // OFF System descriptor lists
+	FileName    string       `json:"filename"`
+	FileSize    int64        `json:"filesize"`
+	BlockHashes []string     `json:"block_hashes"`
+	BlockSize   int          `json:"block_size"`
+	Timestamp   int64        `json:"timestamp"`
+	ContentType string       `json:"content_type"`
+	Version     string       `json:"version"`
+	Descriptors [][][]string `json:"descriptors"` // OFF System descriptor lists with redundancy
 }
 
 // RandomURL represents a rfs:// URL for file access
@@ -214,9 +215,10 @@ func NewRandomFSWithOptions(ipfsAPI string, dataDir string, cacheSize int64, ski
 	}
 
 	rfs := &RandomFS{
-		ipfsAPI:         ipfsAPI,
-		dataDir:         dataDir,
-		useLocalStorage: skipIPFSTest,
+		ipfsAPI:          ipfsAPI,
+		dataDir:          dataDir,
+		useLocalStorage:  skipIPFSTest,
+		RedundancyFactor: 2, // Default redundancy factor
 	}
 
 	// Initialize smart cache
@@ -269,55 +271,57 @@ func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string)
 	// Determine block size based on file size
 	blockSize := rfs.selectBlockSize(int64(len(data)))
 
-	// Generate randomized blocks using OFF System algorithm
-	blocks, err := GenerateRandomBlocks(data, blockSize)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate blocks: %v", err)
-	}
+	// Generate original data blocks
+	originalBlocks := splitIntoBlocks(data, blockSize)
 
-	// Store blocks and build descriptor lists
-	var blockHashes []string
-	var descriptors [][]string
+	var allBlockHashes []string
+	var allDescriptors [][][]string
 
-	for i := 0; i < len(blocks); i += TupleSize {
-		// Each tuple contains: [result_block, randomizer1, randomizer2]
-		tuple := blocks[i : i+TupleSize]
-		if len(tuple) < TupleSize {
-			// Pad with random data if needed
-			for len(tuple) < TupleSize {
-				randomBlock := make([]byte, blockSize)
-				if _, err := rand.Read(randomBlock); err != nil {
-					return nil, fmt.Errorf("failed to generate padding: %v", err)
+	for _, originalBlock := range originalBlocks {
+		var redundantDescriptors [][]string
+		for r := 0; r < rfs.RedundancyFactor; r++ {
+			// Create a new set of randomizer blocks for each redundant copy
+			randomizers := make([][]byte, TupleSize-1)
+			for i := range randomizers {
+				randomizers[i] = make([]byte, blockSize)
+				if _, err := rand.Read(randomizers[i]); err != nil {
+					return nil, fmt.Errorf("failed to generate randomizer block: %v", err)
 				}
-				tuple = append(tuple, randomBlock)
 			}
-		}
 
-		// Store each block in the tuple
-		tupleHashes := make([]string, TupleSize)
-		for j, block := range tuple {
-			hash, err := rfs.storeBlock(block)
-			if err != nil {
-				return nil, fmt.Errorf("failed to store block: %v", err)
+			// Create the anonymized block
+			anonymizedBlock := make([]byte, blockSize)
+			copy(anonymizedBlock, originalBlock)
+			for _, rando := range randomizers {
+				XORBlocksInPlace(anonymizedBlock, rando)
 			}
-			tupleHashes[j] = hash
-			blockHashes = append(blockHashes, hash)
-		}
 
-		// Add descriptor for this tuple
-		descriptors = append(descriptors, tupleHashes)
+			// Store all blocks of the tuple
+			tuple := append([][]byte{anonymizedBlock}, randomizers...)
+			tupleHashes := make([]string, len(tuple))
+			for i, block := range tuple {
+				hash, err := rfs.storeBlock(block)
+				if err != nil {
+					return nil, fmt.Errorf("failed to store block for redundancy set %d: %v", r, err)
+				}
+				tupleHashes[i] = hash
+			}
+			allBlockHashes = append(allBlockHashes, tupleHashes...)
+			redundantDescriptors = append(redundantDescriptors, tupleHashes)
+		}
+		allDescriptors = append(allDescriptors, redundantDescriptors)
 	}
 
 	// Create file representation
 	rep := &FileRepresentation{
 		FileName:    filepath.Base(filename),
 		FileSize:    int64(len(data)),
-		BlockHashes: blockHashes,
+		BlockHashes: allBlockHashes,
 		BlockSize:   blockSize,
 		Timestamp:   time.Now().Unix(),
 		ContentType: contentType,
 		Version:     ProtocolVersion,
-		Descriptors: descriptors,
+		Descriptors: allDescriptors,
 	}
 
 	// Store representation
@@ -338,7 +342,7 @@ func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string)
 
 	// Update statistics
 	rfs.stats.FilesStored++
-	rfs.stats.BlocksGenerated += int64(len(blocks))
+	rfs.stats.BlocksGenerated += int64(len(allBlockHashes))
 	rfs.stats.TotalSize += int64(len(data))
 
 	// Create RandomURL
@@ -353,7 +357,7 @@ func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string)
 	}
 
 	log.Printf("Stored file %s (%d bytes) with %d blocks, representation hash: %s",
-		filename, len(data), len(blocks), repHash)
+		filename, len(data), len(allBlockHashes), repHash)
 
 	return randomURL, nil
 }
@@ -377,55 +381,61 @@ func (rfs *RandomFS) RetrieveFile(repHash string) ([]byte, *FileRepresentation, 
 		return nil, nil, fmt.Errorf("no blocks in representation for file of size %d", rep.FileSize)
 	}
 
-	// --- Parallel Block Retrieval ---
-	type blockResult struct {
-		index int
-		data  []byte
-		err   error
-	}
-
-	blockCount := len(rep.BlockHashes)
-	results := make(chan blockResult, blockCount)
-	var wg sync.WaitGroup
-
-	for i, hash := range rep.BlockHashes {
-		wg.Add(1)
-		go func(idx int, blockHash string) {
-			defer wg.Done()
-			data, err := rfs.retrieveBlock(blockHash)
-			// Pass raw error to channel to be handled in the main goroutine
-			results <- blockResult{idx, data, err}
-		}(i, hash)
-	}
-
-	wg.Wait()
-	close(results)
-
-	// Collect results and check for errors
-	blocks := make([][]byte, blockCount)
-	for result := range results {
-		if result.err != nil {
-			return nil, nil, fmt.Errorf("failed to retrieve block %d ('%s'): %v", result.index, rep.BlockHashes[result.index], result.err)
-		}
-		blocks[result.index] = result.data
-	}
-	// --- End of Parallel Block Retrieval ---
-
 	// Reconstruct original data from retrieved blocks
 	originalData := make([]byte, 0, rep.FileSize)
 
-	if len(blocks)%TupleSize != 0 {
-		return nil, nil, fmt.Errorf("block count (%d) is not a multiple of tuple size (%d)", len(blocks), TupleSize)
+	// Helper to fetch a tuple of blocks
+	fetchTuple := func(hashes []string) ([][]byte, error) {
+		blocks := make([][]byte, len(hashes))
+		var wg sync.WaitGroup
+		errs := make(chan error, len(hashes))
+
+		for i, hash := range hashes {
+			wg.Add(1)
+			go func(i int, hash string) {
+				defer wg.Done()
+				block, err := rfs.retrieveBlock(hash)
+				if err != nil {
+					errs <- fmt.Errorf("failed to retrieve block %s: %v", hash, err)
+					return
+				}
+				blocks[i] = block
+			}(i, hash)
+		}
+		wg.Wait()
+		close(errs)
+
+		if len(errs) > 0 {
+			return nil, <-errs // Return the first error
+		}
+		return blocks, nil
 	}
 
-	for i := 0; i < len(blocks); i += TupleSize {
-		// The first block in a tuple is the one to be XORed with the others.
-		// A new slice is created to hold the result of XORing.
-		originalBlock := make([]byte, len(blocks[i]))
-		copy(originalBlock, blocks[i])
+	for _, redundantDescriptors := range rep.Descriptors {
+		var originalBlock []byte
+		var err error
+		recovered := false
 
-		for j := 1; j < TupleSize; j++ {
-			XORBlocksInPlace(originalBlock, blocks[i+j])
+		for i, descriptor := range redundantDescriptors {
+			tupleBlocks, fetchErr := fetchTuple(descriptor)
+			if fetchErr != nil {
+				err = fmt.Errorf("failed to fetch tuple for descriptor set %d: %v", i, fetchErr)
+				continue // Try next redundant descriptor
+			}
+
+			// Reconstruct the original block
+			reconstructed := make([]byte, len(tupleBlocks[0]))
+			copy(reconstructed, tupleBlocks[0])
+			for j := 1; j < len(tupleBlocks); j++ {
+				XORBlocksInPlace(reconstructed, tupleBlocks[j])
+			}
+			originalBlock = reconstructed
+			recovered = true
+			break // Success
+		}
+
+		if !recovered {
+			return nil, nil, fmt.Errorf("failed to recover block after trying all redundant descriptors: %v", err)
 		}
 		originalData = append(originalData, originalBlock...)
 	}
@@ -842,4 +852,20 @@ func (sr *StreamingReader) getBlock(blockIndex int) ([]byte, error) {
 	sr.blockCache.Add(blockIndex, originalBlock)
 
 	return originalBlock, nil
+}
+
+// splitIntoBlocks is a helper function to divide data into fixed-size blocks.
+func splitIntoBlocks(data []byte, blockSize int) [][]byte {
+	var blocks [][]byte
+	for i := 0; i < len(data); i += blockSize {
+		end := i + blockSize
+		if end > len(data) {
+			end = len(data)
+		}
+		// Pad the last block if it's smaller than blockSize
+		chunk := make([]byte, blockSize)
+		copy(chunk, data[i:end])
+		blocks = append(blocks, chunk)
+	}
+	return blocks
 }
