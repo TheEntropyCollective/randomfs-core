@@ -12,7 +12,7 @@ RandomFS Core is a pure Go library that implements the Owner Free File System co
 - **XOR-based Randomization**: Blocks are randomized using XOR operations for deniability
 - **IPFS Integration**: Uses IPFS HTTP API for decentralized storage
 - **LRU Caching**: Efficient block caching with configurable size limits
-- **rd:// URL Scheme**: Decentralized file access using custom URL format
+- **rfs:// URL Scheme**: Decentralized file access using custom URL format
 - **Pure Go Library**: No external dependencies beyond standard library and IPFS API
 
 ## Installation
@@ -40,14 +40,14 @@ func main() {
     }
 
     // Store a file
-    rdURL, err := rfs.StoreFile("example.txt", "text/plain")
+    rfsURL, err := rfs.StoreFile("example.txt", "text/plain")
     if err != nil {
         log.Fatal(err)
     }
-    fmt.Printf("File stored: %s\n", rdURL)
+    fmt.Printf("File stored: %s\n", rfsURL)
 
     // Retrieve a file
-    data, contentType, err := rfs.RetrieveFile(rdURL)
+    data, contentType, err := rfs.RetrieveFile(rfsURL)
     if err != nil {
         log.Fatal(err)
     }
@@ -67,17 +67,17 @@ Creates a new RandomFS instance.
 
 ### StoreFile(filePath, contentType string) (string, error)
 
-Stores a file and returns its rd:// URL.
+Stores a file and returns its rfs:// URL.
 
 - `filePath`: Path to the file to store
 - `contentType`: MIME type of the file
-- Returns: rd:// URL for file retrieval
+- Returns: rfs:// URL for file retrieval
 
 ### RetrieveFile(rdURL string) ([]byte, string, error)
 
-Retrieves a file using its rd:// URL.
+Retrieves a file using its rfs:// URL.
 
-- `rdURL`: rd:// URL of the file to retrieve
+- `rfsURL`: rfs:// URL of the file to retrieve
 - Returns: file data, content type, and error
 
 ### GetStats() Stats
@@ -92,15 +92,15 @@ RandomFS uses a multi-tier approach for optimal performance:
 - **Medium files (1MB - 64MB)**: 64KB blocks  
 - **Large files (> 64MB)**: 1MB blocks
 
-## rd:// URL Format
+## rfs:// URL Format
 
-Files are accessed using the rd:// URL scheme:
+Files are accessed using the rfs:// URL scheme:
 
 ```
-rd://<representation-hash>/<content-type>/<original-filename>
+rfs://<representation-hash>/<content-type>/<original-filename>
 ```
 
-Example: `rd://QmX...abc/text/plain/example.txt`
+Example: `rfs://QmX...abc/text/plain/example.txt`
 
 ## Dependencies
 

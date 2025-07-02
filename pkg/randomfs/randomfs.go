@@ -77,7 +77,7 @@ type FileRepresentation struct {
 	Descriptors [][]string `json:"descriptors"` // OFF System descriptor lists
 }
 
-// RandomURL represents a rd:// URL for file access
+// RandomURL represents a rfs:// URL for file access
 type RandomURL struct {
 	Scheme    string
 	Host      string
@@ -248,7 +248,7 @@ func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string)
 
 	// Create RandomURL
 	randomURL := &RandomURL{
-		Scheme:    "rd",
+		Scheme:    "rfs",
 		Host:      "randomfs",
 		Version:   ProtocolVersion,
 		FileName:  rep.FileName,
@@ -576,20 +576,20 @@ func (rfs *RandomFS) catFromLocalStorage(hash string, dataType string) ([]byte, 
 	return data, nil
 }
 
-// ParseRandomURL parses a rd:// URL
+// ParseRandomURL parses a rfs:// URL
 func ParseRandomURL(rawURL string) (*RandomURL, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid URL: %v", err)
 	}
 
-	if u.Scheme != "rd" {
-		return nil, fmt.Errorf("invalid scheme: expected 'rd', got '%s'", u.Scheme)
+	if u.Scheme != "rfs" {
+		return nil, fmt.Errorf("invalid scheme: expected 'rfs', got '%s'", u.Scheme)
 	}
 
 	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
 	if len(parts) < 4 {
-		return nil, fmt.Errorf("invalid rd:// URL format")
+		return nil, fmt.Errorf("invalid rfs:// URL format")
 	}
 
 	fileSize, err := strconv.ParseInt(parts[1], 10, 64)
@@ -615,6 +615,6 @@ func ParseRandomURL(rawURL string) (*RandomURL, error) {
 
 // String returns the string representation of a RandomURL
 func (ru *RandomURL) String() string {
-	return fmt.Sprintf("rd://%s/%s/%d/%s/%d/%s",
+	return fmt.Sprintf("rfs://%s/%s/%d/%s/%d/%s",
 		ru.Host, ru.Version, ru.FileSize, ru.FileName, ru.Timestamp, ru.RepHash)
 }
