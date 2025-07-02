@@ -97,10 +97,10 @@ RandomFS uses a multi-tier approach for optimal performance:
 Files are accessed using the rfs:// URL scheme:
 
 ```
-rfs://<representation-hash>/<content-type>/<original-filename>
+rfs://<hash>
 ```
 
-Example: `rfs://QmX...abc/text/plain/example.txt`
+Example: `rfs://QmX...abc`
 
 ## Dependencies
 

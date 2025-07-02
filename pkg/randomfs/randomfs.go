@@ -13,7 +13,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -588,33 +587,24 @@ func ParseRandomURL(rawURL string) (*RandomURL, error) {
 	}
 
 	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-	if len(parts) < 4 {
-		return nil, fmt.Errorf("invalid rfs:// URL format")
+	if len(parts) != 1 {
+		return nil, fmt.Errorf("invalid rfs:// URL format: expected rfs://<hash>")
 	}
 
-	fileSize, err := strconv.ParseInt(parts[1], 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("invalid file size: %v", err)
-	}
-
-	timestamp, err := strconv.ParseInt(parts[3], 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("invalid timestamp: %v", err)
-	}
+	hash := parts[0]
 
 	return &RandomURL{
 		Scheme:    u.Scheme,
 		Host:      u.Host,
-		Version:   parts[0],
-		FileName:  parts[2],
-		FileSize:  fileSize,
-		RepHash:   parts[4],
-		Timestamp: timestamp,
+		Version:   ProtocolVersion,
+		FileName:  "", // Will be retrieved from representation
+		FileSize:  0,  // Will be retrieved from representation
+		RepHash:   hash,
+		Timestamp: 0, // Will be retrieved from representation
 	}, nil
 }
 
 // String returns the string representation of a RandomURL
 func (ru *RandomURL) String() string {
-	return fmt.Sprintf("rfs://%s/%s/%d/%s/%d/%s",
-		ru.Host, ru.Version, ru.FileSize, ru.FileName, ru.Timestamp, ru.RepHash)
+	return fmt.Sprintf("rfs://%s", ru.RepHash)
 }
