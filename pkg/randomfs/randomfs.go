@@ -33,6 +33,10 @@ const (
 
 	// Default IPFS API endpoint
 	DefaultIPFSEndpoint = "http://localhost:5001"
+
+	// TupleSize defines the number of blocks in an OFFSystem tuple.
+	// This includes the anonymized block and its randomizer blocks.
+	TupleSize = 3
 )
 
 // RandomFS represents the main filesystem instance
@@ -181,14 +185,13 @@ func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string)
 	// Store blocks and build descriptor lists
 	var blockHashes []string
 	var descriptors [][]string
-	tupleSize := 3
 
-	for i := 0; i < len(blocks); i += tupleSize {
+	for i := 0; i < len(blocks); i += TupleSize {
 		// Each tuple contains: [result_block, randomizer1, randomizer2]
-		tuple := blocks[i : i+tupleSize]
-		if len(tuple) < tupleSize {
+		tuple := blocks[i : i+TupleSize]
+		if len(tuple) < TupleSize {
 			// Pad with random data if needed
-			for len(tuple) < tupleSize {
+			for len(tuple) < TupleSize {
 				randomBlock := make([]byte, blockSize)
 				if _, err := rand.Read(randomBlock); err != nil {
 					return nil, fmt.Errorf("failed to generate padding: %v", err)
@@ -198,7 +201,7 @@ func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string)
 		}
 
 		// Store each block in the tuple
-		tupleHashes := make([]string, tupleSize)
+		tupleHashes := make([]string, TupleSize)
 		for j, block := range tuple {
 			hash, err := rfs.storeBlock(block)
 			if err != nil {
@@ -262,8 +265,88 @@ func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string)
 	return randomURL, nil
 }
 
-// RetrieveFile retrieves and reconstructs a file from its representation hash using OFF System algorithm
+// RetrieveFile retrieves a file from the randomized block format using parallel block fetching.
 func (rfs *RandomFS) RetrieveFile(repHash string) ([]byte, *FileRepresentation, error) {
+	rfs.mutex.RLock()
+	defer rfs.mutex.RUnlock()
+
+	// Get file representation
+	rep, err := rfs.getRepresentation(repHash)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Handle case with no blocks (e.g., empty file)
+	if len(rep.BlockHashes) == 0 {
+		if rep.FileSize == 0 {
+			return []byte{}, rep, nil
+		}
+		return nil, nil, fmt.Errorf("no blocks in representation for file of size %d", rep.FileSize)
+	}
+
+	// --- Parallel Block Retrieval ---
+	type blockResult struct {
+		index int
+		data  []byte
+		err   error
+	}
+
+	blockCount := len(rep.BlockHashes)
+	results := make(chan blockResult, blockCount)
+	var wg sync.WaitGroup
+
+	for i, hash := range rep.BlockHashes {
+		wg.Add(1)
+		go func(idx int, blockHash string) {
+			defer wg.Done()
+			data, err := rfs.retrieveBlock(blockHash)
+			// Pass raw error to channel to be handled in the main goroutine
+			results <- blockResult{idx, data, err}
+		}(i, hash)
+	}
+
+	wg.Wait()
+	close(results)
+
+	// Collect results and check for errors
+	blocks := make([][]byte, blockCount)
+	for result := range results {
+		if result.err != nil {
+			return nil, nil, fmt.Errorf("failed to retrieve block %d ('%s'): %v", result.index, rep.BlockHashes[result.index], result.err)
+		}
+		blocks[result.index] = result.data
+	}
+	// --- End of Parallel Block Retrieval ---
+
+	// Reconstruct original data from retrieved blocks
+	originalData := make([]byte, 0, rep.FileSize)
+
+	if len(blocks)%TupleSize != 0 {
+		return nil, nil, fmt.Errorf("block count (%d) is not a multiple of tuple size (%d)", len(blocks), TupleSize)
+	}
+
+	for i := 0; i < len(blocks); i += TupleSize {
+		// The first block in a tuple is the one to be XORed with the others.
+		// A new slice is created to hold the result of XORing.
+		originalBlock := make([]byte, len(blocks[i]))
+		copy(originalBlock, blocks[i])
+
+		for j := 1; j < TupleSize; j++ {
+			XORBlocksInPlace(originalBlock, blocks[i+j])
+		}
+		originalData = append(originalData, originalBlock...)
+	}
+
+	// Truncate to original file size
+	if int64(len(originalData)) > rep.FileSize {
+		originalData = originalData[:rep.FileSize]
+	}
+
+	return originalData, rep, nil
+}
+
+// getRepresentation retrieves and parses a file representation from IPFS or local storage
+func (rfs *RandomFS) getRepresentation(repHash string) (*FileRepresentation, error) {
 	// Retrieve representation
 	var repData []byte
 	var err error
@@ -273,61 +356,20 @@ func (rfs *RandomFS) RetrieveFile(repHash string) ([]byte, *FileRepresentation, 
 		repData, err = rfs.catFromIPFS(repHash)
 	}
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to retrieve representation: %v", err)
+		return nil, fmt.Errorf("failed to retrieve representation: %v", err)
 	}
 
 	var rep FileRepresentation
 	if err := json.Unmarshal(repData, &rep); err != nil {
-		return nil, nil, fmt.Errorf("failed to unmarshal representation: %v", err)
+		return nil, fmt.Errorf("failed to unmarshal representation: %v", err)
 	}
 
-	// Retrieve and combine blocks using OFF System algorithm
-	var reconstructed bytes.Buffer
-	blockIndex := 0
-
-	for _, descriptor := range rep.Descriptors {
-		// Retrieve all blocks in this descriptor tuple
-		tupleBlocks := make([][]byte, len(descriptor))
-		for i, blockHash := range descriptor {
-			blockData, err := rfs.retrieveBlock(blockHash)
-			if err != nil {
-				return nil, nil, fmt.Errorf("failed to retrieve block %d: %v", i, err)
-			}
-			tupleBlocks[i] = blockData
-		}
-
-		// Perform OFF System reconstruction: s_i = b_1 ⊕ b_2 ⊕ ... ⊕ b_t
-		reconstructedBlock := make([]byte, rep.BlockSize)
-		copy(reconstructedBlock, tupleBlocks[0]) // Start with first block
-
-		// XOR with all other blocks in the tuple
-		for i := 1; i < len(tupleBlocks); i++ {
-			XORBlocksInPlace(reconstructedBlock, tupleBlocks[i])
-		}
-
-		// Determine how much data to write (handle last block)
-		remaining := rep.FileSize - int64(reconstructed.Len())
-		if remaining <= int64(rep.BlockSize) {
-			// Last block - only write the actual data
-			reconstructed.Write(reconstructedBlock[:remaining])
-		} else {
-			// Full block
-			reconstructed.Write(reconstructedBlock)
-		}
-
-		blockIndex++
-	}
-
-	log.Printf("Retrieved file %s (%d bytes) from %d descriptor tuples",
-		rep.FileName, rep.FileSize, len(rep.Descriptors))
-
-	return reconstructed.Bytes(), &rep, nil
+	return &rep, nil
 }
 
 // GenerateRandomBlocks creates randomized blocks using the OFF System algorithm
 func GenerateRandomBlocks(data []byte, blockSize int) ([][]byte, error) {
 	var blocks [][]byte
-	tupleSize := 3 // Default tuple size as per OFF System
 
 	for offset := 0; offset < len(data); offset += blockSize {
 		end := offset + blockSize
@@ -342,8 +384,8 @@ func GenerateRandomBlocks(data []byte, blockSize int) ([][]byte, error) {
 		copy(paddedChunk, chunk)
 
 		// Select t-1 randomizer blocks from existing cache or generate new ones
-		randomizers := make([][]byte, tupleSize-1)
-		for i := 0; i < tupleSize-1; i++ {
+		randomizers := make([][]byte, TupleSize-1)
+		for i := 0; i < TupleSize-1; i++ {
 			// For now, generate new random blocks
 			// In a real implementation, you'd select from existing cache
 			randomBlock := make([]byte, blockSize)
