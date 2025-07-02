@@ -254,3 +254,47 @@ func TestRedundancyRecovery(t *testing.T) {
 	}
 	t.Logf("Successfully recovered file using redundant descriptor.")
 }
+
+// TestNetworkHealthMonitoring tests the collection of network health metrics.
+func TestNetworkHealthMonitoring(t *testing.T) {
+	rfs, _, teardown := setupTestFS(t)
+	defer teardown()
+
+	// 1. Store a file and retrieve it.
+	testData := []byte("This is a test for network health monitoring.")
+	url, err := rfs.StoreFile("monitoring_test.txt", testData, "text/plain")
+	if err != nil {
+		t.Fatalf("StoreFile failed: %v", err)
+	}
+
+	initialStats := rfs.GetStats()
+	_, _, err = rfs.RetrieveFile(url.RepHash)
+	if err != nil {
+		t.Fatalf("RetrieveFile failed: %v", err)
+	}
+	statsAfterSuccess := rfs.GetStats()
+
+	rep, _ := rfs.getRepresentation(url.RepHash)
+	// In the happy path, only the primary descriptors are used.
+	expectedRetrievals := int64(len(rep.Descriptors) * TupleSize)
+
+	if statsAfterSuccess.SuccessfulRetrievals != initialStats.SuccessfulRetrievals+expectedRetrievals {
+		t.Errorf("Expected %d successful retrievals, but got %d",
+			expectedRetrievals, statsAfterSuccess.SuccessfulRetrievals-initialStats.SuccessfulRetrievals)
+	}
+	if statsAfterSuccess.TotalRetrievalLatency <= initialStats.TotalRetrievalLatency {
+		t.Error("Expected total retrieval latency to increase.")
+	}
+
+	// 2. Attempt to retrieve a non-existent block.
+	statsBeforeFailure := rfs.GetStats()
+	_, err = rfs.retrieveBlock("non-existent-hash")
+	if err == nil {
+		t.Error("Expected an error when retrieving a non-existent block, but got nil.")
+	}
+	statsAfterFailure := rfs.GetStats()
+
+	if statsAfterFailure.BlockRetrievalFailures <= statsBeforeFailure.BlockRetrievalFailures {
+		t.Error("Expected block retrieval failures to increase, but it did not.")
+	}
+}

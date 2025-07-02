@@ -56,11 +56,15 @@ type RandomFS struct {
 
 // Stats holds system statistics
 type Stats struct {
-	FilesStored     int64 `json:"files_stored"`
-	BlocksGenerated int64 `json:"blocks_generated"`
-	TotalSize       int64 `json:"total_size"`
-	CacheHits       int64 `json:"cache_hits"`
-	CacheMisses     int64 `json:"cache_misses"`
+	FilesStored            int64         `json:"files_stored"`
+	BlocksGenerated        int64         `json:"blocks_generated"`
+	TotalSize              int64         `json:"total_size"`
+	CacheHits              int64         `json:"cache_hits"`
+	CacheMisses            int64         `json:"cache_misses"`
+	BlockRetrievalFailures int64         `json:"block_retrieval_failures"`
+	TotalRetrievalLatency  time.Duration `json:"total_retrieval_latency"`
+	SuccessfulRetrievals   int64         `json:"successful_retrievals"`
+	mutex                  sync.Mutex
 }
 
 // SmartBlockCache implements a multi-tier caching strategy for blocks.
@@ -99,13 +103,17 @@ func (sbc *SmartBlockCache) Get(hash string) ([]byte, error) {
 
 	// 1. Check hot cache
 	if data, ok := sbc.hot.Get(hash); ok {
+		sbc.stats.mutex.Lock()
 		sbc.stats.CacheHits++
+		sbc.stats.mutex.Unlock()
 		return data.([]byte), nil
 	}
 
 	// 2. Check warm cache
 	if data, ok := sbc.warm.Get(hash); ok {
+		sbc.stats.mutex.Lock()
 		sbc.stats.CacheHits++
+		sbc.stats.mutex.Unlock()
 		// Promote to hot cache if accessed frequently enough
 		if sbc.shouldPromote(hash) {
 			sbc.warm.Remove(hash)
@@ -115,7 +123,9 @@ func (sbc *SmartBlockCache) Get(hash string) ([]byte, error) {
 	}
 
 	// 3. Fetch from cold storage (IPFS or local disk)
+	sbc.stats.mutex.Lock()
 	sbc.stats.CacheMisses++
+	sbc.stats.mutex.Unlock()
 	var blockData []byte
 	var err error
 	if sbc.rfs.useLocalStorage {
@@ -243,9 +253,18 @@ func NewRandomFSWithOptions(ipfsAPI string, dataDir string, cacheSize int64, ski
 
 // GetStats returns current system statistics
 func (rfs *RandomFS) GetStats() Stats {
-	rfs.mutex.RLock()
-	defer rfs.mutex.RUnlock()
-	return rfs.stats
+	rfs.stats.mutex.Lock()
+	defer rfs.stats.mutex.Unlock()
+	return Stats{
+		FilesStored:            rfs.stats.FilesStored,
+		BlocksGenerated:        rfs.stats.BlocksGenerated,
+		TotalSize:              rfs.stats.TotalSize,
+		CacheHits:              rfs.stats.CacheHits,
+		CacheMisses:            rfs.stats.CacheMisses,
+		BlockRetrievalFailures: rfs.stats.BlockRetrievalFailures,
+		TotalRetrievalLatency:  rfs.stats.TotalRetrievalLatency,
+		SuccessfulRetrievals:   rfs.stats.SuccessfulRetrievals,
+	}
 }
 
 // testIPFSConnection tests if IPFS daemon is accessible
@@ -341,9 +360,11 @@ func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string)
 	}
 
 	// Update statistics
+	rfs.stats.mutex.Lock()
 	rfs.stats.FilesStored++
 	rfs.stats.BlocksGenerated += int64(len(allBlockHashes))
 	rfs.stats.TotalSize += int64(len(data))
+	rfs.stats.mutex.Unlock()
 
 	// Create RandomURL
 	randomURL := &RandomURL{
@@ -569,7 +590,20 @@ func (rfs *RandomFS) storeBlock(block []byte) (string, error) {
 
 // retrieveBlock retrieves a block from the cache or IPFS
 func (rfs *RandomFS) retrieveBlock(hash string) ([]byte, error) {
-	return rfs.blockCache.Get(hash)
+	startTime := time.Now()
+	block, err := rfs.blockCache.Get(hash)
+
+	rfs.stats.mutex.Lock()
+	defer rfs.stats.mutex.Unlock()
+
+	if err != nil {
+		rfs.stats.BlockRetrievalFailures++
+	} else {
+		rfs.stats.SuccessfulRetrievals++
+		rfs.stats.TotalRetrievalLatency += time.Since(startTime)
+	}
+
+	return block, err
 }
 
 // selectBlockSize determines the appropriate block size for a file
