@@ -148,3 +148,68 @@ func TestStreamingReader(t *testing.T) {
 	}
 	t.Logf("Successfully streamed and verified large file.")
 }
+
+// TestSmartCache tests the functionality of the multi-tier smart cache.
+func TestSmartCache(t *testing.T) {
+	rfs, teardown := setupTestFS(t)
+	defer teardown()
+
+	// 1. Store a file to populate the cache.
+	testData := []byte("This is a test for the smart cache.")
+	url, err := rfs.StoreFile("caching_test.txt", testData, "text/plain")
+	if err != nil {
+		t.Fatalf("StoreFile failed: %v", err)
+	}
+
+	rep, err := rfs.getRepresentation(url.RepHash)
+	if err != nil {
+		t.Fatalf("getRepresentation failed: %v", err)
+	}
+
+	// Get a block hash to test with.
+	if len(rep.BlockHashes) == 0 {
+		t.Fatal("No blocks were created for the test file.")
+	}
+	blockHash := rep.BlockHashes[0]
+
+	// 2. Clear caches to ensure we start from a clean slate for this test.
+	rfs.blockCache.hot.Purge()
+	rfs.blockCache.warm.Purge()
+
+	// 3. First retrieval should be a cache miss.
+	initialStats := rfs.GetStats()
+	_, err = rfs.retrieveBlock(blockHash)
+	if err != nil {
+		t.Fatalf("retrieveBlock failed: %v", err)
+	}
+	statsAfterMiss := rfs.GetStats()
+	if statsAfterMiss.CacheMisses <= initialStats.CacheMisses {
+		t.Errorf("Expected a cache miss, but miss count did not increase.")
+	}
+	if !rfs.blockCache.warm.Contains(blockHash) {
+		t.Error("Block should be in the warm cache after a miss.")
+	}
+
+	// 4. Second retrieval should be a hit from the warm cache.
+	statsBeforeHit := rfs.GetStats()
+	_, err = rfs.retrieveBlock(blockHash)
+	if err != nil {
+		t.Fatalf("retrieveBlock failed: %v", err)
+	}
+	statsAfterHit := rfs.GetStats()
+	if statsAfterHit.CacheHits <= statsBeforeHit.CacheHits {
+		t.Errorf("Expected a cache hit, but hit count did not increase.")
+	}
+
+	// 5. Retrieve two more times to trigger promotion.
+	_, _ = rfs.retrieveBlock(blockHash)
+	_, _ = rfs.retrieveBlock(blockHash)
+
+	// 6. Verify promotion to hot cache.
+	if !rfs.blockCache.hot.Contains(blockHash) {
+		t.Error("Block should be promoted to the hot cache after multiple accesses.")
+	}
+	if rfs.blockCache.warm.Contains(blockHash) {
+		t.Error("Block should be removed from warm cache after promotion.")
+	}
+}

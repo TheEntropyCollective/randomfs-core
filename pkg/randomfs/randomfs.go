@@ -45,7 +45,7 @@ const (
 type RandomFS struct {
 	ipfsAPI         string
 	dataDir         string
-	blockCache      *BlockCache
+	blockCache      *SmartBlockCache
 	mutex           sync.RWMutex
 	useLocalStorage bool
 
@@ -62,12 +62,91 @@ type Stats struct {
 	CacheMisses     int64 `json:"cache_misses"`
 }
 
-// BlockCache manages block storage and retrieval
-type BlockCache struct {
-	blocks      map[string][]byte
-	mutex       sync.RWMutex
-	maxSize     int64
-	currentSize int64
+// SmartBlockCache implements a multi-tier caching strategy for blocks.
+type SmartBlockCache struct {
+	hot         *lru.Cache // For frequently accessed blocks
+	warm        *lru.Cache // For recently accessed blocks
+	rfs         *RandomFS  // To access underlying storage
+	mutex       sync.Mutex
+	stats       *Stats
+	promoCounts map[string]int // For promotion policy
+}
+
+// NewSmartBlockCache creates a new smart block cache.
+func NewSmartBlockCache(rfs *RandomFS, stats *Stats, size int) (*SmartBlockCache, error) {
+	hot, err := lru.New(size / 2)
+	if err != nil {
+		return nil, err
+	}
+	warm, err := lru.New(size / 2)
+	if err != nil {
+		return nil, err
+	}
+	return &SmartBlockCache{
+		hot:         hot,
+		warm:        warm,
+		rfs:         rfs,
+		stats:       stats,
+		promoCounts: make(map[string]int),
+	}, nil
+}
+
+// Get retrieves a block from the cache or underlying storage.
+func (sbc *SmartBlockCache) Get(hash string) ([]byte, error) {
+	sbc.mutex.Lock()
+	defer sbc.mutex.Unlock()
+
+	// 1. Check hot cache
+	if data, ok := sbc.hot.Get(hash); ok {
+		sbc.stats.CacheHits++
+		return data.([]byte), nil
+	}
+
+	// 2. Check warm cache
+	if data, ok := sbc.warm.Get(hash); ok {
+		sbc.stats.CacheHits++
+		// Promote to hot cache if accessed frequently enough
+		if sbc.shouldPromote(hash) {
+			sbc.warm.Remove(hash)
+			sbc.hot.Add(hash, data)
+		}
+		return data.([]byte), nil
+	}
+
+	// 3. Fetch from cold storage (IPFS or local disk)
+	sbc.stats.CacheMisses++
+	var blockData []byte
+	var err error
+	if sbc.rfs.useLocalStorage {
+		blockData, err = sbc.rfs.catFromLocalStorage(hash, "block")
+	} else {
+		blockData, err = sbc.rfs.catFromIPFS(hash)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Add to warm cache
+	sbc.warm.Add(hash, blockData)
+
+	return blockData, nil
+}
+
+// Put adds a block to the cache.
+func (sbc *SmartBlockCache) Put(hash string, data []byte) {
+	sbc.mutex.Lock()
+	defer sbc.mutex.Unlock()
+	sbc.warm.Add(hash, data)
+}
+
+// shouldPromote decides if a block should move from warm to hot cache.
+func (sbc *SmartBlockCache) shouldPromote(hash string) bool {
+	sbc.promoCounts[hash]++
+	if sbc.promoCounts[hash] >= 3 {
+		delete(sbc.promoCounts, hash)
+		return true
+	}
+	return false
 }
 
 // FileRepresentation contains the metadata needed to reconstruct a file
@@ -138,11 +217,14 @@ func NewRandomFSWithOptions(ipfsAPI string, dataDir string, cacheSize int64, ski
 		ipfsAPI:         ipfsAPI,
 		dataDir:         dataDir,
 		useLocalStorage: skipIPFSTest,
-		blockCache: &BlockCache{
-			blocks:  make(map[string][]byte),
-			maxSize: cacheSize,
-		},
 	}
+
+	// Initialize smart cache
+	cache, err := NewSmartBlockCache(rfs, &rfs.stats, 100) // Cache up to 100 blocks total
+	if err != nil {
+		return nil, fmt.Errorf("failed to create smart cache: %v", err)
+	}
+	rfs.blockCache = cache
 
 	// Test IPFS connection unless skipped
 	if !skipIPFSTest {
@@ -469,51 +551,15 @@ func (rfs *RandomFS) storeBlock(block []byte) (string, error) {
 		return "", err
 	}
 
-	// Cache locally for faster access
-	rfs.blockCache.mutex.Lock()
-	defer rfs.blockCache.mutex.Unlock()
-
-	rfs.blockCache.blocks[hash] = block
-	rfs.blockCache.currentSize += int64(len(block))
-
-	// Simple cache eviction if over limit
-	if rfs.blockCache.currentSize > rfs.blockCache.maxSize {
-		rfs.evictOldestBlocks()
-	}
+	// Add to cache
+	rfs.blockCache.Put(hash, block)
 
 	return hash, nil
 }
 
-// retrieveBlock retrieves a block from cache or IPFS
+// retrieveBlock retrieves a block from the cache or IPFS
 func (rfs *RandomFS) retrieveBlock(hash string) ([]byte, error) {
-	// Check cache first
-	rfs.blockCache.mutex.RLock()
-	if block, exists := rfs.blockCache.blocks[hash]; exists {
-		rfs.blockCache.mutex.RUnlock()
-		rfs.stats.CacheHits++
-		return block, nil
-	}
-	rfs.blockCache.mutex.RUnlock()
-
-	// Retrieve from storage
-	rfs.stats.CacheMisses++
-	if rfs.useLocalStorage {
-		return rfs.catFromLocalStorage(hash, "block")
-	}
-	return rfs.catFromIPFS(hash)
-}
-
-// evictOldestBlocks removes oldest blocks from cache
-func (rfs *RandomFS) evictOldestBlocks() {
-	// Simple implementation - remove half the cache
-	target := rfs.blockCache.maxSize / 2
-	for hash, block := range rfs.blockCache.blocks {
-		delete(rfs.blockCache.blocks, hash)
-		rfs.blockCache.currentSize -= int64(len(block))
-		if rfs.blockCache.currentSize <= target {
-			break
-		}
-	}
+	return rfs.blockCache.Get(hash)
 }
 
 // selectBlockSize determines the appropriate block size for a file
