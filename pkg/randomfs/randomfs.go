@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	lru "github.com/hashicorp/golang-lru"
 )
 
 const (
@@ -89,6 +91,15 @@ type RandomURL struct {
 	FileSize  int64
 	RepHash   string
 	Timestamp int64
+}
+
+// StreamingReader enables reading large files as a stream.
+type StreamingReader struct {
+	rfs        *RandomFS
+	rep        *FileRepresentation
+	position   int64
+	blockCache *lru.Cache // Caches reconstructed original blocks
+	mutex      sync.Mutex
 }
 
 // NewRandomFS creates a new RandomFS instance
@@ -649,4 +660,140 @@ func ParseRandomURL(rawURL string) (*RandomURL, error) {
 // String returns the string representation of a RandomURL
 func (ru *RandomURL) String() string {
 	return fmt.Sprintf("rfs://%s", ru.RepHash)
+}
+
+// OpenStream returns a StreamingReader for a file, allowing it to be read in chunks.
+func (rfs *RandomFS) OpenStream(repHash string) (*StreamingReader, error) {
+	rep, err := rfs.getRepresentation(repHash)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cache for reconstructed blocks.
+	cache, err := lru.New(10)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create LRU cache for streaming: %v", err)
+	}
+
+	return &StreamingReader{
+		rfs:        rfs,
+		rep:        rep,
+		blockCache: cache,
+	}, nil
+}
+
+// Read implements the io.Reader interface for StreamingReader.
+func (sr *StreamingReader) Read(p []byte) (n int, err error) {
+	sr.mutex.Lock()
+	defer sr.mutex.Unlock()
+
+	if sr.position >= sr.rep.FileSize {
+		return 0, io.EOF
+	}
+
+	blockIndex := int(sr.position / int64(sr.rep.BlockSize))
+	blockOffset := int(sr.position % int64(sr.rep.BlockSize))
+
+	// Get the reconstructed block, loading if not in cache.
+	originalBlock, err := sr.getBlock(blockIndex)
+	if err != nil {
+		return 0, err
+	}
+
+	// Copy data from the block to the destination buffer 'p'.
+	bytesToCopy := len(originalBlock) - blockOffset
+	if bytesToCopy > len(p) {
+		bytesToCopy = len(p)
+	}
+
+	// Ensure we don't read past the end of the file.
+	if sr.position+int64(bytesToCopy) > sr.rep.FileSize {
+		bytesToCopy = int(sr.rep.FileSize - sr.position)
+	}
+
+	if bytesToCopy <= 0 {
+		return 0, io.EOF
+	}
+
+	copy(p, originalBlock[blockOffset:blockOffset+bytesToCopy])
+
+	sr.position += int64(bytesToCopy)
+
+	// Simple prefetch for the next block.
+	if sr.position < sr.rep.FileSize {
+		nextBlockIndex := int(sr.position / int64(sr.rep.BlockSize))
+		if nextBlockIndex > blockIndex {
+			go sr.getBlock(nextBlockIndex) // Prefetch in the background, errors are ignored.
+		}
+	}
+
+	return bytesToCopy, nil
+}
+
+// getBlock retrieves a single reconstructed block, from cache or by fetching and derandomizing.
+func (sr *StreamingReader) getBlock(blockIndex int) ([]byte, error) {
+	// Check cache first.
+	if cachedBlock, ok := sr.blockCache.Get(blockIndex); ok {
+		return cachedBlock.([]byte), nil
+	}
+
+	// Block not in cache, load it.
+	numOriginalBlocks := (len(sr.rep.BlockHashes) + TupleSize - 1) / TupleSize
+	if blockIndex >= numOriginalBlocks {
+		return nil, io.EOF
+	}
+
+	start := blockIndex * TupleSize
+	end := start + TupleSize
+	if end > len(sr.rep.BlockHashes) {
+		end = len(sr.rep.BlockHashes)
+	}
+
+	tupleHashes := sr.rep.BlockHashes[start:end]
+
+	// Retrieve tuple blocks in parallel.
+	type blockResult struct {
+		idx  int
+		data []byte
+		err  error
+	}
+
+	results := make(chan blockResult, len(tupleHashes))
+	var wg sync.WaitGroup
+
+	for i, hash := range tupleHashes {
+		wg.Add(1)
+		go func(i int, hash string) {
+			defer wg.Done()
+			data, err := sr.rfs.retrieveBlock(hash)
+			results <- blockResult{i, data, err}
+		}(i, hash)
+	}
+
+	wg.Wait()
+	close(results)
+
+	tupleBlocks := make([][]byte, len(tupleHashes))
+	for res := range results {
+		if res.err != nil {
+			return nil, fmt.Errorf("failed to retrieve block %s for tuple %d: %v", tupleHashes[res.idx], blockIndex, res.err)
+		}
+		tupleBlocks[res.idx] = res.data
+	}
+
+	// Reconstruct the original block by XORing.
+	if len(tupleBlocks) == 0 {
+		return nil, fmt.Errorf("no blocks found for tuple %d", blockIndex)
+	}
+	originalBlock := make([]byte, len(tupleBlocks[0]))
+	copy(originalBlock, tupleBlocks[0])
+
+	for i := 1; i < len(tupleBlocks); i++ {
+		XORBlocksInPlace(originalBlock, tupleBlocks[i])
+	}
+
+	// Add to cache.
+	sr.blockCache.Add(blockIndex, originalBlock)
+
+	return originalBlock, nil
 }
