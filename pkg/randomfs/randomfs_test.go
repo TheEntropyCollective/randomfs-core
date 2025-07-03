@@ -131,3 +131,40 @@ func TestRedundancyRecoveryWithEncryption(t *testing.T) {
 		t.Fatal("Retrieved data after recovery does not match original data")
 	}
 }
+
+func TestCoverTraffic(t *testing.T) {
+	rfs, _, teardown := setupTestFS(t)
+	defer teardown()
+
+	// Store a file to ensure there are blocks in the index to be used as decoys.
+	testData := []byte("some data to test cover traffic")
+	repHash, err := rfs.StoreFile("cover_traffic.txt", testData, "text/plain", testPassword)
+	if err != nil {
+		t.Fatalf("Failed to store file: %v", err)
+	}
+
+	// Wait a moment for the block index to be populated from the initial storage.
+	// This is a simplification for the test; in reality, the index is updated in real-time.
+	initialStats := rfs.GetStats()
+
+	// Retrieve the file. This should trigger decoy block fetching.
+	_, rep, err := rfs.RetrieveFile(repHash, testPassword)
+	if err != nil {
+		t.Fatalf("Failed to retrieve file: %v", err)
+	}
+
+	finalStats := rfs.GetStats()
+
+	// Calculate the number of legitimate blocks that should have been fetched.
+	// For this test, we assume no failures, so it's the number of blocks per descriptor.
+	legitBlocks := len(rep.Descriptors) * TupleSize
+
+	// The total number of successful retrievals should be the sum of legitimate blocks and decoy blocks.
+	// We expect the number of retrievals to be greater than just the legitimate blocks.
+	totalRetrievals := finalStats.SuccessfulRetrievals - initialStats.SuccessfulRetrievals
+	if totalRetrievals <= int64(legitBlocks) {
+		t.Errorf("Expected cover traffic to increase retrieval count beyond legitimate blocks. Got %d total retrievals, expected > %d", totalRetrievals, legitBlocks)
+	}
+
+	t.Logf("Successfully verified cover traffic. Legitimate blocks: %d, Total retrievals: %d", legitBlocks, totalRetrievals)
+}

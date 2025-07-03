@@ -414,6 +414,15 @@ func (rfs *RandomFS) RetrieveFile(repHash string, password string) ([]byte, *Fil
 	fileData := make([][]byte, len(rep.Descriptors))
 	blockErrors := make(chan error, len(rep.Descriptors))
 
+	// --- Cover Traffic ---
+	// Fetch decoy blocks concurrently to obfuscate the real block requests.
+	numDecoys := len(rep.Descriptors) * TupleSize // Fetch roughly same number of decoys as real blocks
+	decoyHashes := rfs.selectDecoyBlocks(numDecoys)
+	for _, decoyHash := range decoyHashes {
+		go rfs.retrieveBlock(decoyHash) // We don't care about the result, just the network traffic.
+	}
+	// ---------------------
+
 	for i := range rep.Descriptors {
 		wg.Add(1)
 		go func(blockIndex int) {
@@ -1110,4 +1119,27 @@ func (rfs *RandomFS) updateStats(updateFunc func(*Stats)) {
 	rfs.stats.mutex.Lock()
 	defer rfs.stats.mutex.Unlock()
 	updateFunc(&rfs.stats)
+}
+
+// selectDecoyBlocks selects a number of random block hashes from the index for cover traffic.
+func (rfs *RandomFS) selectDecoyBlocks(count int) []string {
+	rfs.blockIndexMutex.Lock()
+	defer rfs.blockIndexMutex.Unlock()
+
+	if len(rfs.blockIndex) < 2 {
+		return []string{} // Not enough blocks to select decoys
+	}
+
+	numToSelect := count
+	if len(rfs.blockIndex) < count {
+		numToSelect = len(rfs.blockIndex)
+	}
+
+	// Just select randomly from the index
+	indices := mrand.Perm(len(rfs.blockIndex))
+	decoys := make([]string, numToSelect)
+	for i := 0; i < numToSelect; i++ {
+		decoys[i] = rfs.blockIndex[indices[i]]
+	}
+	return decoys
 }
