@@ -56,6 +56,13 @@ type RandomFS struct {
 	blockPopularity      map[string]int
 	blockPopularityMutex sync.Mutex
 
+	// Block metadata tracking
+	blockCreationTime   map[string]time.Time
+	blockLastUsed       map[string]time.Time
+	blockLatencyHistory map[string][]time.Duration
+	blockRetrievalStats map[string]*BlockRetrievalStats
+	blockMetadataMutex  sync.RWMutex
+
 	// Statistics
 	stats Stats
 }
@@ -211,12 +218,16 @@ func NewRandomFSWithOptions(ipfsAPI string, dataDir string, cacheSize int64, ski
 	}
 
 	rfs := &RandomFS{
-		ipfsAPI:         ipfsAPI,
-		dataDir:         dataDir,
-		useLocalStorage: skipIPFSTest,
-		blockIndex:      make([]string, 0),
-		analyzer:        &ContentAnalyzer{},
-		blockPopularity: make(map[string]int),
+		ipfsAPI:             ipfsAPI,
+		dataDir:             dataDir,
+		useLocalStorage:     skipIPFSTest,
+		blockIndex:          make([]string, 0),
+		analyzer:            &ContentAnalyzer{},
+		blockPopularity:     make(map[string]int),
+		blockCreationTime:   make(map[string]time.Time),
+		blockLastUsed:       make(map[string]time.Time),
+		blockLatencyHistory: make(map[string][]time.Duration),
+		blockRetrievalStats: make(map[string]*BlockRetrievalStats),
 	}
 
 	// Load existing block hashes into the index if using local storage
@@ -554,8 +565,10 @@ func (rfs *RandomFS) decryptData(encryptedData []byte, password string) ([]byte,
 
 // XORBlocksInPlace XORs b into a in place (up to the length of b)
 func XORBlocksInPlace(a, b []byte) {
-	for i := 0; i < len(b) && i < len(a); i++ {
-		a[i] ^= b[i]
+	for i := range b {
+		if i < len(a) {
+			a[i] ^= b[i]
+		}
 	}
 }
 
@@ -581,6 +594,14 @@ func (rfs *RandomFS) storeBlock(block []byte) (string, error) {
 	rfs.blockIndexMutex.Lock()
 	rfs.blockIndex = append(rfs.blockIndex, hash)
 	rfs.blockIndexMutex.Unlock()
+
+	// Track block creation time and initialize metadata
+	rfs.blockMetadataMutex.Lock()
+	if _, exists := rfs.blockCreationTime[hash]; !exists {
+		rfs.blockCreationTime[hash] = time.Now()
+		rfs.blockRetrievalStats[hash] = &BlockRetrievalStats{}
+	}
+	rfs.blockMetadataMutex.Unlock()
 
 	return hash, nil
 }
@@ -615,10 +636,19 @@ func (rfs *RandomFS) StoreAndIndexBlocks(blocks [][]byte) ([]string, error) {
 
 	// Add all blocks to cache and index
 	rfs.blockIndexMutex.Lock()
+	rfs.blockMetadataMutex.Lock()
+	creationTime := time.Now()
 	for i, hash := range hashes {
 		rfs.blockCache.Put(hash, blocks[i])
 		rfs.blockIndex = append(rfs.blockIndex, hash)
+
+		// Track block creation time and initialize metadata
+		if _, exists := rfs.blockCreationTime[hash]; !exists {
+			rfs.blockCreationTime[hash] = creationTime
+			rfs.blockRetrievalStats[hash] = &BlockRetrievalStats{}
+		}
 	}
+	rfs.blockMetadataMutex.Unlock()
 	rfs.blockIndexMutex.Unlock()
 
 	return hashes, nil
@@ -628,16 +658,41 @@ func (rfs *RandomFS) StoreAndIndexBlocks(blocks [][]byte) ([]string, error) {
 func (rfs *RandomFS) retrieveBlock(hash string) ([]byte, error) {
 	startTime := time.Now()
 	block, err := rfs.blockCache.Get(hash)
+	latency := time.Since(startTime)
 
 	rfs.stats.mutex.Lock()
 	defer rfs.stats.mutex.Unlock()
 
+	// Update block metadata
+	rfs.blockMetadataMutex.Lock()
+	// Track latency history (keep last 10 measurements)
+	if history, exists := rfs.blockLatencyHistory[hash]; exists {
+		if len(history) >= 10 {
+			history = history[1:] // Remove oldest measurement
+		}
+		rfs.blockLatencyHistory[hash] = append(history, latency)
+	} else {
+		rfs.blockLatencyHistory[hash] = []time.Duration{latency}
+	}
+
+	// Update retrieval statistics
+	stats, exists := rfs.blockRetrievalStats[hash]
+	if !exists {
+		stats = &BlockRetrievalStats{}
+		rfs.blockRetrievalStats[hash] = stats
+	}
+
 	if err != nil {
+		stats.FailureCount++
+		stats.LastFailure = time.Now()
 		rfs.stats.BlockRetrievalFailures++
 	} else {
+		stats.SuccessCount++
+		stats.LastSuccess = time.Now()
 		rfs.stats.SuccessfulRetrievals++
-		rfs.stats.TotalRetrievalLatency += time.Since(startTime)
+		rfs.stats.TotalRetrievalLatency += latency
 	}
+	rfs.blockMetadataMutex.Unlock()
 
 	return block, err
 }
@@ -845,12 +900,9 @@ func (rfs *RandomFS) catFromLocalStorage(hash string, dataType string) ([]byte, 
 
 // splitIntoBlocks is a helper function to divide data into fixed-size blocks.
 func splitIntoBlocks(data []byte, blockSize int) [][]byte {
-	var blocks [][]byte
+	blocks := make([][]byte, 0, (len(data)+blockSize-1)/blockSize)
 	for i := 0; i < len(data); i += blockSize {
-		end := i + blockSize
-		if end > len(data) {
-			end = len(data)
-		}
+		end := min(i+blockSize, len(data))
 		// Pad the last block if it's smaller than blockSize
 		chunk := make([]byte, blockSize)
 		copy(chunk, data[i:end])
@@ -874,10 +926,34 @@ func (rfs *RandomFS) selectRandomizerBlocks(count int, blockSize int) (blocks []
 	for _, hash := range candidateHashes {
 		data, err := rfs.retrieveBlock(hash) // This uses the cache, so it should be fast.
 		if err == nil {
+			// Calculate block age
+			rfs.blockMetadataMutex.RLock()
+			creationTime, hasCreationTime := rfs.blockCreationTime[hash]
+			lastUsed, hasLastUsed := rfs.blockLastUsed[hash]
+			rfs.blockMetadataMutex.RUnlock()
+
+			var age time.Duration
+			if hasCreationTime {
+				age = time.Since(creationTime)
+			}
+
+			var lastUsedTime time.Time
+			if hasLastUsed {
+				lastUsedTime = lastUsed
+			}
+
+			// Get network performance metrics
+			avgLatency := rfs.calculateAverageLatency(hash)
+			availability := rfs.calculateAvailabilityScore(hash)
+
 			candidates = append(candidates, BlockCandidate{
-				Hash:       hash,
-				Data:       data,
-				Popularity: rfs.blockPopularity[hash], // Get popularity
+				Hash:           hash,
+				Data:           data,
+				Popularity:     rfs.blockPopularity[hash],
+				Age:            age,
+				LastUsed:       lastUsedTime,
+				NetworkLatency: avgLatency,
+				Availability:   availability,
 			})
 		}
 	}
@@ -894,6 +970,8 @@ func (rfs *RandomFS) selectRandomizerBlocks(count int, blockSize int) (blocks []
 		optimalCandidates := rfs.analyzer.selectOptimalBlocks(candidates, numToSelect, MinEntropyThreshold)
 		for _, c := range optimalCandidates {
 			selectedBlocks = append(selectedBlocks, c.Data)
+			// Mark block as recently used for future scoring
+			rfs.updateBlockLastUsed(c.Hash)
 		}
 	}
 
@@ -925,15 +1003,12 @@ func (rfs *RandomFS) selectRandomizerHashes(count int) []string {
 		return []string{}
 	}
 
-	numToPick := count
-	if len(rfs.blockIndex) < count {
-		numToPick = len(rfs.blockIndex)
-	}
+	numToPick := min(count, len(rfs.blockIndex))
 
 	// Shuffle indices to pick random, unique blocks.
 	indices := mrand.Perm(len(rfs.blockIndex))
 	pickedHashes := make([]string, numToPick)
-	for i := 0; i < numToPick; i++ {
+	for i := range pickedHashes {
 		pickedHashes[i] = rfs.blockIndex[indices[i]]
 	}
 	return pickedHashes
@@ -949,10 +1024,26 @@ func (rfs *RandomFS) loadBlockIndex() {
 	}
 
 	rfs.blockIndexMutex.Lock()
+	rfs.blockMetadataMutex.Lock()
 	defer rfs.blockIndexMutex.Unlock()
+	defer rfs.blockMetadataMutex.Unlock()
+
 	for _, entry := range entries {
 		if !entry.IsDir() {
-			rfs.blockIndex = append(rfs.blockIndex, entry.Name())
+			hash := entry.Name()
+			rfs.blockIndex = append(rfs.blockIndex, hash)
+
+			// Initialize metadata for existing blocks
+			// Use file modification time as creation time estimate
+			if info, err := entry.Info(); err == nil {
+				rfs.blockCreationTime[hash] = info.ModTime()
+			} else {
+				// Fallback to current time if we can't get file info
+				rfs.blockCreationTime[hash] = time.Now()
+			}
+
+			// Initialize retrieval stats
+			rfs.blockRetrievalStats[hash] = &BlockRetrievalStats{}
 		}
 	}
 	log.Printf("Loaded %d block hashes into index from local storage.", len(rfs.blockIndex))
@@ -982,8 +1073,72 @@ func (rfs *RandomFS) selectDecoyBlocks(count int) []string {
 	// Just select randomly from the index
 	indices := mrand.Perm(len(rfs.blockIndex))
 	decoys := make([]string, numToSelect)
-	for i := 0; i < numToSelect; i++ {
+	for i := range decoys {
 		decoys[i] = rfs.blockIndex[indices[i]]
 	}
 	return decoys
+}
+
+// BlockRetrievalStats tracks success/failure rates for block retrieval
+type BlockRetrievalStats struct {
+	SuccessCount int
+	FailureCount int
+	LastSuccess  time.Time
+	LastFailure  time.Time
+}
+
+// calculateAverageLatency calculates the average latency for a block hash
+func (rfs *RandomFS) calculateAverageLatency(hash string) time.Duration {
+	rfs.blockMetadataMutex.RLock()
+	defer rfs.blockMetadataMutex.RUnlock()
+
+	history, exists := rfs.blockLatencyHistory[hash]
+	if !exists || len(history) == 0 {
+		return 0
+	}
+
+	var total time.Duration
+	for _, latency := range history {
+		total += latency
+	}
+	return total / time.Duration(len(history))
+}
+
+// calculateAvailabilityScore calculates an availability score (0-1) for a block hash
+func (rfs *RandomFS) calculateAvailabilityScore(hash string) float64 {
+	rfs.blockMetadataMutex.RLock()
+	defer rfs.blockMetadataMutex.RUnlock()
+
+	stats, exists := rfs.blockRetrievalStats[hash]
+	if !exists {
+		return 1.0 // Default to high availability for new blocks
+	}
+
+	totalRequests := stats.SuccessCount + stats.FailureCount
+	if totalRequests == 0 {
+		return 1.0 // No requests yet, assume high availability
+	}
+
+	successRate := float64(stats.SuccessCount) / float64(totalRequests)
+
+	// Apply time decay - recent failures are weighted more heavily
+	now := time.Now()
+	if !stats.LastFailure.IsZero() {
+		timeSinceLastFailure := now.Sub(stats.LastFailure)
+
+		// If failure was recent (< 1 hour), reduce availability score
+		if timeSinceLastFailure < time.Hour {
+			decayFactor := 1.0 - (time.Hour-timeSinceLastFailure).Seconds()/time.Hour.Seconds()
+			successRate *= (1.0 - 0.3*decayFactor) // Up to 30% penalty for recent failures
+		}
+	}
+
+	return successRate
+}
+
+// updateBlockLastUsed marks a block as recently used for randomization
+func (rfs *RandomFS) updateBlockLastUsed(hash string) {
+	rfs.blockMetadataMutex.Lock()
+	defer rfs.blockMetadataMutex.Unlock()
+	rfs.blockLastUsed[hash] = time.Now()
 }
