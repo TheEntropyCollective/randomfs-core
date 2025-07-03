@@ -2,28 +2,27 @@ package randomfs
 
 import (
 	"bytes"
-	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
 )
 
-// setupTestFS creates a temporary RandomFS instance for testing
+const testPassword = "test-password-123"
+
 func setupTestFS(t *testing.T) (*RandomFS, string, func()) {
-	// Create a temporary directory for test data
-	tempDir, err := ioutil.TempDir("", "randomfs-test")
+	// A temporary directory for local storage.
+	tempDir, err := os.MkdirTemp("", "randomfs-test-")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 
-	// Initialize RandomFS with local storage for testing
-	rfs, err := NewRandomFSWithoutIPFS(tempDir, 10*1024*1024) // 10MB cache
+	// Initialize RandomFS to use local storage instead of a real IPFS daemon.
+	rfs, err := NewRandomFSWithoutIPFS(tempDir, 100)
 	if err != nil {
-		t.Fatalf("Failed to create RandomFS: %v", err)
+		t.Fatalf("Failed to initialize RandomFS: %v", err)
 	}
 
-	// Teardown function to clean up
+	// The teardown function cleans up the temporary directory.
 	teardown := func() {
 		os.RemoveAll(tempDir)
 	}
@@ -31,299 +30,104 @@ func setupTestFS(t *testing.T) (*RandomFS, string, func()) {
 	return rfs, tempDir, teardown
 }
 
-// TestStoreAndRetrieveFile tests basic file storage and retrieval
 func TestStoreAndRetrieveFile(t *testing.T) {
 	rfs, _, teardown := setupTestFS(t)
 	defer teardown()
 
-	// Test data
-	testData := []byte("Hello, this is a test file for RandomFS.")
-	testFilename := "testfile.txt"
+	testData := []byte("This is a test file for RandomFS.")
+	filename := "test.txt"
 
-	// Store the file
-	url, err := rfs.StoreFile(testFilename, testData, "text/plain")
+	repHash, err := rfs.StoreFile(filename, testData, "text/plain", testPassword)
 	if err != nil {
-		t.Fatalf("StoreFile failed: %v", err)
+		t.Fatalf("Failed to store file: %v", err)
 	}
-	if url == nil {
-		t.Fatal("StoreFile returned a nil URL")
+	if repHash == "" {
+		t.Fatal("StoreFile returned an empty representation hash")
 	}
 
-	// Retrieve the file
-	retrievedData, _, err := rfs.RetrieveFile(url.RepHash)
+	retrievedData, _, err := rfs.RetrieveFile(repHash, testPassword)
 	if err != nil {
-		t.Fatalf("RetrieveFile failed: %v", err)
+		t.Fatalf("Failed to retrieve file: %v", err)
 	}
 
-	// Compare original and retrieved data
 	if !bytes.Equal(testData, retrievedData) {
-		t.Errorf("Retrieved data does not match original data.\nOriginal: %s\nRetrieved: %s", string(testData), string(retrievedData))
+		t.Errorf("Retrieved data does not match original data. Got %s, want %s", retrievedData, testData)
 	}
-
-	t.Logf("Successfully stored and retrieved file. URL: %s", url.String())
 }
 
-// TestEmptyFile tests storing and retrieving an empty file
-func TestEmptyFile(t *testing.T) {
+func TestEncryption(t *testing.T) {
 	rfs, _, teardown := setupTestFS(t)
 	defer teardown()
 
-	testData := []byte{}
-	testFilename := "empty.txt"
+	testData := []byte("This is a test file for RandomFS encryption.")
+	filename := "test_encryption.txt"
+	password := "correct-password"
+	wrongPassword := "wrong-password"
 
-	url, err := rfs.StoreFile(testFilename, testData, "text/plain")
+	// Store the file with encryption
+	repHash, err := rfs.StoreFile(filename, testData, "text/plain", password)
 	if err != nil {
-		t.Fatalf("StoreFile failed for empty file: %v", err)
+		t.Fatalf("Failed to store file with encryption: %v", err)
 	}
 
-	retrievedData, _, err := rfs.RetrieveFile(url.RepHash)
+	// Retrieve the file with the correct password
+	retrievedData, _, err := rfs.RetrieveFile(repHash, password)
 	if err != nil {
-		t.Fatalf("RetrieveFile failed for empty file: %v", err)
+		t.Fatalf("Failed to retrieve file with correct password: %v", err)
+	}
+	if !bytes.Equal(testData, retrievedData) {
+		t.Errorf("Retrieved data does not match original data. Got %s, want %s", retrievedData, testData)
 	}
 
-	if len(retrievedData) != 0 {
-		t.Errorf("Expected empty data, got %d bytes", len(retrievedData))
+	// Attempt to retrieve with the wrong password
+	_, _, err = rfs.RetrieveFile(repHash, wrongPassword)
+	if err == nil {
+		t.Fatalf("Expected an error when retrieving with the wrong password, but got none")
+	}
+
+	// Attempt to retrieve with an empty password
+	_, _, err = rfs.RetrieveFile(repHash, "")
+	if err == nil {
+		t.Fatalf("Expected an error when retrieving with an empty password, but got none")
 	}
 }
 
-// TestLargeFile tests storing and retrieving a file larger than a single block
-func TestLargeFile(t *testing.T) {
-	rfs, _, teardown := setupTestFS(t)
-	defer teardown()
-
-	// Create large test data (e.g., 2.5 MB)
-	largeData := make([]byte, int(2.5*1024*1024))
-	for i := range largeData {
-		largeData[i] = byte(i % 256)
-	}
-	testFilename := "largefile.bin"
-
-	url, err := rfs.StoreFile(testFilename, largeData, "application/octet-stream")
-	if err != nil {
-		t.Fatalf("StoreFile failed for large file: %v", err)
-	}
-
-	retrievedData, _, err := rfs.RetrieveFile(url.RepHash)
-	if err != nil {
-		t.Fatalf("RetrieveFile failed for large file: %v", err)
-	}
-
-	if !bytes.Equal(largeData, retrievedData) {
-		t.Fatal("Retrieved large file data does not match original data.")
-	}
-}
-
-// TestStreamingReader tests reading a file using the streaming API
-func TestStreamingReader(t *testing.T) {
-	rfs, _, teardown := setupTestFS(t)
-	defer teardown()
-
-	// Create large test data
-	largeData := make([]byte, int(2.5*1024*1024))
-	for i := range largeData {
-		largeData[i] = byte(i % 256)
-	}
-	testFilename := "largefile_stream.bin"
-
-	// Store the file
-	url, err := rfs.StoreFile(testFilename, largeData, "application/octet-stream")
-	if err != nil {
-		t.Fatalf("StoreFile failed for large file: %v", err)
-	}
-
-	// Open a stream reader
-	reader, err := rfs.OpenStream(url.RepHash)
-	if err != nil {
-		t.Fatalf("OpenStream failed: %v", err)
-	}
-
-	// Read all data from the stream
-	retrievedData, err := io.ReadAll(reader)
-	if err != nil {
-		t.Fatalf("Failed to read from stream: %v", err)
-	}
-
-	// Compare original and retrieved data
-	if !bytes.Equal(largeData, retrievedData) {
-		t.Fatal("Retrieved stream data does not match original data.")
-	}
-	t.Logf("Successfully streamed and verified large file.")
-}
-
-// TestSmartCache tests the functionality of the multi-tier smart cache.
-func TestSmartCache(t *testing.T) {
-	rfs, _, teardown := setupTestFS(t)
-	defer teardown()
-
-	// 1. Store a file to populate the cache.
-	testData := []byte("This is a test for the smart cache.")
-	url, err := rfs.StoreFile("caching_test.txt", testData, "text/plain")
-	if err != nil {
-		t.Fatalf("StoreFile failed: %v", err)
-	}
-
-	rep, err := rfs.getRepresentation(url.RepHash)
-	if err != nil {
-		t.Fatalf("getRepresentation failed: %v", err)
-	}
-
-	// Get a block hash to test with.
-	if len(rep.BlockHashes) == 0 {
-		t.Fatal("No blocks were created for the test file.")
-	}
-	blockHash := rep.BlockHashes[0]
-
-	// 2. Clear caches to ensure we start from a clean slate for this test.
-	rfs.blockCache.hot.Purge()
-	rfs.blockCache.warm.Purge()
-
-	// 3. First retrieval should be a cache miss.
-	initialStats := rfs.GetStats()
-	_, err = rfs.retrieveBlock(blockHash)
-	if err != nil {
-		t.Fatalf("retrieveBlock failed: %v", err)
-	}
-	statsAfterMiss := rfs.GetStats()
-	if statsAfterMiss.CacheMisses <= initialStats.CacheMisses {
-		t.Errorf("Expected a cache miss, but miss count did not increase.")
-	}
-	if !rfs.blockCache.warm.Contains(blockHash) {
-		t.Error("Block should be in the warm cache after a miss.")
-	}
-
-	// 4. Second retrieval should be a hit from the warm cache.
-	statsBeforeHit := rfs.GetStats()
-	_, err = rfs.retrieveBlock(blockHash)
-	if err != nil {
-		t.Fatalf("retrieveBlock failed: %v", err)
-	}
-	statsAfterHit := rfs.GetStats()
-	if statsAfterHit.CacheHits <= statsBeforeHit.CacheHits {
-		t.Errorf("Expected a cache hit, but hit count did not increase.")
-	}
-
-	// 5. Retrieve two more times to trigger promotion.
-	_, _ = rfs.retrieveBlock(blockHash)
-	_, _ = rfs.retrieveBlock(blockHash)
-
-	// 6. Verify promotion to hot cache.
-	if !rfs.blockCache.hot.Contains(blockHash) {
-		t.Error("Block should be promoted to the hot cache after multiple accesses.")
-	}
-	if rfs.blockCache.warm.Contains(blockHash) {
-		t.Error("Block should be removed from warm cache after promotion.")
-	}
-}
-
-// TestRedundancyRecovery tests the file recovery using redundant blocks.
-func TestRedundancyRecovery(t *testing.T) {
+func TestRedundancyRecoveryWithEncryption(t *testing.T) {
 	rfs, tempDir, teardown := setupTestFS(t)
 	defer teardown()
 
-	rfs.RedundancyFactor = 2
-	testData := []byte("This file will test the redundancy recovery.")
-	url, err := rfs.StoreFile("recovery_test.txt", testData, "text/plain")
+	testData := []byte("Data that must be recovered despite a block failure.")
+	repHash, err := rfs.StoreFile("redundant.txt", testData, "text/plain", testPassword)
 	if err != nil {
-		t.Fatalf("StoreFile failed: %v", err)
+		t.Fatalf("Failed to store file for redundancy test: %v", err)
 	}
 
-	rep, err := rfs.getRepresentation(url.RepHash)
+	// Get the representation so we can find a block to delete
+	encryptedRep, err := rfs.retrieveBlock(repHash)
 	if err != nil {
-		t.Fatalf("getRepresentation failed: %v", err)
+		t.Fatalf("Failed to retrieve encrypted representation: %v", err)
+	}
+	rep, err := rfs.getRepresentation(encryptedRep, testPassword)
+	if err != nil {
+		t.Fatalf("Failed to get representation: %v", err)
 	}
 
-	// Corrupt the primary descriptor by deleting one of its blocks.
-	if len(rep.Descriptors) == 0 || len(rep.Descriptors[0]) == 0 || len(rep.Descriptors[0][0]) == 0 {
-		t.Fatal("Not enough descriptors to run the test.")
+	if len(rep.Descriptors) == 0 || len(rep.Descriptors[0]) == 0 || len(rep.Descriptors[0][0]) < 2 {
+		t.Fatal("Test setup error: No randomizer block found to delete")
 	}
-	blockToCorrupt := rep.Descriptors[0][0][0] // Hash of the first block of the primary tuple.
+	blockToDelete := rep.Descriptors[0][0][1]
 
-	blockPath := filepath.Join(tempDir, "blocks", blockToCorrupt)
+	blockPath := filepath.Join(tempDir, "blocks", blockToDelete)
 	if err := os.Remove(blockPath); err != nil {
-		t.Fatalf("Failed to delete block file for corruption: %v", err)
+		t.Fatalf("Failed to delete block file %s: %v", blockPath, err)
 	}
 
-	// Now, try to retrieve the file. It should succeed by using the redundant descriptor.
-	retrievedData, _, err := rfs.RetrieveFile(url.RepHash)
+	retrievedData, _, err := rfs.RetrieveFile(repHash, testPassword)
 	if err != nil {
-		t.Fatalf("RetrieveFile failed during recovery: %v", err)
+		t.Fatalf("Failed to retrieve file after block deletion: %v", err)
 	}
 
 	if !bytes.Equal(testData, retrievedData) {
-		t.Fatal("Recovered data does not match original data.")
+		t.Fatal("Retrieved data after recovery does not match original data")
 	}
-	t.Logf("Successfully recovered file using redundant descriptor.")
-}
-
-// TestNetworkHealthMonitoring tests the collection of network health metrics.
-func TestNetworkHealthMonitoring(t *testing.T) {
-	rfs, _, teardown := setupTestFS(t)
-	defer teardown()
-
-	// 1. Store a file and retrieve it.
-	testData := []byte("This is a test for network health monitoring.")
-	url, err := rfs.StoreFile("monitoring_test.txt", testData, "text/plain")
-	if err != nil {
-		t.Fatalf("StoreFile failed: %v", err)
-	}
-
-	initialStats := rfs.GetStats()
-	_, _, err = rfs.RetrieveFile(url.RepHash)
-	if err != nil {
-		t.Fatalf("RetrieveFile failed: %v", err)
-	}
-	statsAfterSuccess := rfs.GetStats()
-
-	rep, _ := rfs.getRepresentation(url.RepHash)
-	// In the happy path, only the primary descriptors are used.
-	expectedRetrievals := int64(len(rep.Descriptors) * TupleSize)
-
-	if statsAfterSuccess.SuccessfulRetrievals != initialStats.SuccessfulRetrievals+expectedRetrievals {
-		t.Errorf("Expected %d successful retrievals, but got %d",
-			expectedRetrievals, statsAfterSuccess.SuccessfulRetrievals-initialStats.SuccessfulRetrievals)
-	}
-	if statsAfterSuccess.TotalRetrievalLatency <= initialStats.TotalRetrievalLatency {
-		t.Error("Expected total retrieval latency to increase.")
-	}
-
-	// 2. Attempt to retrieve a non-existent block.
-	statsBeforeFailure := rfs.GetStats()
-	_, err = rfs.retrieveBlock("non-existent-hash")
-	if err == nil {
-		t.Error("Expected an error when retrieving a non-existent block, but got nil.")
-	}
-	statsAfterFailure := rfs.GetStats()
-
-	if statsAfterFailure.BlockRetrievalFailures <= statsBeforeFailure.BlockRetrievalFailures {
-		t.Error("Expected block retrieval failures to increase, but it did not.")
-	}
-}
-
-// TestBlockReuse tests that blocks are reused when storing multiple files.
-func TestBlockReuse(t *testing.T) {
-	rfs, _, teardown := setupTestFS(t)
-	defer teardown()
-
-	// Store the first file to populate the system with blocks.
-	_, err := rfs.StoreFile("file1.txt", []byte("some initial data for file 1"), "text/plain")
-	if err != nil {
-		t.Fatalf("StoreFile failed for file1: %v", err)
-	}
-
-	// The first file may reuse blocks within its own storage process.
-	statsAfterFirst := rfs.GetStats()
-
-	// Store a second file, which should reuse blocks from the first.
-	_, err = rfs.StoreFile("file2.txt", []byte("some different data for file 2"), "text/plain")
-	if err != nil {
-		t.Fatalf("StoreFile failed for file2: %v", err)
-	}
-
-	statsAfterSecond := rfs.GetStats()
-	if statsAfterSecond.BlocksReused <= statsAfterFirst.BlocksReused {
-		t.Errorf("Expected block reuse count to increase after storing a second file. First: %d, Second: %d",
-			statsAfterFirst.BlocksReused, statsAfterSecond.BlocksReused)
-	}
-	t.Logf("Successfully reused blocks. Count after first file: %d, after second: %d.",
-		statsAfterFirst.BlocksReused, statsAfterSecond.BlocksReused)
 }

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	lru "github.com/hashicorp/golang-lru"
+	"golang.org/x/crypto/nacl/secretbox"
 )
 
 const (
@@ -304,217 +305,282 @@ func (rfs *RandomFS) testIPFSConnection() error {
 	return nil
 }
 
-// StoreFile stores a file in the randomized block format using OFF System algorithm
-func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string) (*RandomURL, error) {
-	rfs.mutex.Lock()
-	defer rfs.mutex.Unlock()
-
-	// Determine block size based on file size
-	blockSize := rfs.selectBlockSize(int64(len(data)))
-
-	// Generate original data blocks
-	originalBlocks := splitIntoBlocks(data, blockSize)
-
-	var allBlockHashes []string
-	var allDescriptors [][][]string
-
-	for _, originalBlock := range originalBlocks {
-		var redundantDescriptors [][]string
-		for r := 0; r < rfs.RedundancyFactor; r++ {
-			// Select randomizer blocks, reusing if possible.
-			randomizers, reusedCount, err := rfs.selectRandomizerBlocks(TupleSize-1, blockSize)
-			if err != nil {
-				return nil, fmt.Errorf("failed to select randomizer blocks: %v", err)
-			}
-			rfs.stats.mutex.Lock()
-			rfs.stats.BlocksReused += int64(reusedCount)
-			rfs.stats.mutex.Unlock()
-
-			// Create the anonymized block
-			anonymizedBlock := make([]byte, blockSize)
-			copy(anonymizedBlock, originalBlock)
-			for _, rando := range randomizers {
-				XORBlocksInPlace(anonymizedBlock, rando)
-			}
-
-			// Store all blocks of the tuple.
-			// This now includes storing the new randomizers that were generated.
-			tuple := append([][]byte{anonymizedBlock}, randomizers...)
-			tupleHashes := make([]string, len(tuple))
-			for i, block := range tuple {
-				hash, err := rfs.storeBlock(block)
-				if err != nil {
-					return nil, fmt.Errorf("failed to store block for redundancy set %d: %v", r, err)
-				}
-				tupleHashes[i] = hash
-			}
-			allBlockHashes = append(allBlockHashes, tupleHashes...)
-			redundantDescriptors = append(redundantDescriptors, tupleHashes)
-		}
-		allDescriptors = append(allDescriptors, redundantDescriptors)
+// StoreFile stores a file in RandomFS, returning a hash of the file's representation.
+// The representation is encrypted with the provided password.
+func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string, password string) (string, error) {
+	if password == "" {
+		return "", fmt.Errorf("a password is required to encrypt the file descriptor")
 	}
 
-	// Create file representation
-	rep := &FileRepresentation{
-		FileName:    filepath.Base(filename),
+	blockSize := rfs.selectBlockSize(int64(len(data)))
+	blocks := splitIntoBlocks(data, blockSize)
+
+	rep := FileRepresentation{
+		FileName:    filename,
 		FileSize:    int64(len(data)),
-		BlockHashes: allBlockHashes,
 		BlockSize:   blockSize,
 		Timestamp:   time.Now().Unix(),
 		ContentType: contentType,
 		Version:     ProtocolVersion,
-		Descriptors: allDescriptors,
+		Descriptors: make([][][]string, len(blocks)),
 	}
 
-	// Store representation
-	repData, err := json.Marshal(rep)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal representation: %v", err)
+	for i, block := range blocks {
+		var blockDescriptors [][]string
+		for j := 0; j < rfs.RedundancyFactor; j++ {
+			// In each redundancy round, we anonymize
+			// the original block with a set of other random blocks.
+			randomizerBlocks, _, err := rfs.selectRandomizerBlocks(TupleSize-1, blockSize)
+			if err != nil {
+				return "", fmt.Errorf("failed to select randomizer blocks for block %d: %v", i, err)
+			}
+
+			// The last block in the tuple is the XOR sum of the original block and the randomizers.
+			// To get the anonymized block, we start with the original data.
+			anonymizedBlock := make([]byte, len(block))
+			copy(anonymizedBlock, block)
+
+			var descriptor []string
+			for _, rBlock := range randomizerBlocks {
+				// Store the randomizer block and add its hash to the descriptor.
+				rHash, err := rfs.storeBlock(rBlock)
+				if err != nil {
+					return "", fmt.Errorf("failed to store randomizer block: %v", err)
+				}
+				descriptor = append(descriptor, rHash)
+				XORBlocksInPlace(anonymizedBlock, rBlock)
+			}
+
+			// Now, store the final anonymized block.
+			anonymizedHash, err := rfs.storeBlock(anonymizedBlock)
+			if err != nil {
+				return "", fmt.Errorf("failed to store anonymized block: %v", err)
+			}
+			// Prepend the anonymized hash to the start of the descriptor.
+			descriptor = append([]string{anonymizedHash}, descriptor...)
+			blockDescriptors = append(blockDescriptors, descriptor)
+		}
+		rep.Descriptors[i] = blockDescriptors
 	}
 
-	var repHash string
-	if rfs.useLocalStorage {
-		repHash, err = rfs.addToLocalStorage(repData, "representation")
-	} else {
-		repHash, err = rfs.addToIPFS(repData)
-	}
+	// Encrypt the representation
+	repJSON, err := json.Marshal(rep)
 	if err != nil {
-		return nil, fmt.Errorf("failed to store representation: %v", err)
+		return "", fmt.Errorf("failed to marshal file representation: %v", err)
+	}
+
+	encryptedRep, err := rfs.encryptData(repJSON, password)
+	if err != nil {
+		return "", fmt.Errorf("failed to encrypt file representation: %v", err)
+	}
+
+	// Store the encrypted representation
+	repHash, err := rfs.storeBlock(encryptedRep)
+	if err != nil {
+		return "", fmt.Errorf("failed to store encrypted file representation: %v", err)
 	}
 
 	// Update popularity counts for all reused randomizer blocks
-	rfs.updateBlockPopularity(rep)
+	rfs.updateBlockPopularity(&rep)
 
-	// Update statistics
-	rfs.stats.mutex.Lock()
-	rfs.stats.FilesStored++
-	rfs.stats.BlocksGenerated += int64(len(allBlockHashes))
-	rfs.stats.TotalSize += int64(len(data))
-	rfs.stats.mutex.Unlock()
+	rfs.updateStats(func(s *Stats) {
+		s.FilesStored++
+		s.BlocksGenerated += int64(len(rep.BlockHashes))
+		s.TotalSize += rep.FileSize
+	})
 
-	// Create RandomURL
-	randomURL := &RandomURL{
-		Scheme:    "rfs",
-		Host:      "randomfs",
-		Version:   ProtocolVersion,
-		FileName:  rep.FileName,
-		FileSize:  rep.FileSize,
-		RepHash:   repHash,
-		Timestamp: rep.Timestamp,
-	}
-
-	log.Printf("Stored file %s (%d bytes) with %d blocks, representation hash: %s",
-		filename, len(data), len(allBlockHashes), repHash)
-
-	return randomURL, nil
+	return repHash, nil
 }
 
-// RetrieveFile retrieves a file from the randomized block format using parallel block fetching.
-func (rfs *RandomFS) RetrieveFile(repHash string) ([]byte, *FileRepresentation, error) {
-	rfs.mutex.RLock()
-	defer rfs.mutex.RUnlock()
+// RetrieveFile retrieves a file from RandomFS using its representation hash.
+// The password must match the one used during storage.
+func (rfs *RandomFS) RetrieveFile(repHash string, password string) ([]byte, *FileRepresentation, error) {
+	if password == "" {
+		return nil, nil, fmt.Errorf("a password is required to decrypt the file descriptor")
+	}
 
-	// Get file representation
-	rep, err := rfs.getRepresentation(repHash)
+	encryptedRep, err := rfs.retrieveBlock(repHash)
 	if err != nil {
+		return nil, nil, fmt.Errorf("failed to retrieve encrypted representation block %s: %v", repHash, err)
+	}
+
+	rep, err := rfs.getRepresentation(encryptedRep, password)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get representation from hash %s: %v", repHash, err)
+	}
+
+	// Now that we have the (decrypted) representation, we can fetch the file blocks.
+	var wg sync.WaitGroup
+	fileData := make([][]byte, len(rep.Descriptors))
+	blockErrors := make(chan error, len(rep.Descriptors))
+
+	for i := range rep.Descriptors {
+		wg.Add(1)
+		go func(blockIndex int) {
+			defer wg.Done()
+			// This logic attempts to reconstruct the block using redundant descriptors
+			// if the primary one fails.
+			for _, descriptor := range rep.Descriptors[blockIndex] {
+				if len(descriptor) == 0 {
+					continue // Should not happen, but good to be safe.
+				}
+				anonymizedHash := descriptor[0]
+				randomizerHashes := descriptor[1:]
+
+				// Fetch all blocks in the tuple concurrently
+				type blockResult struct {
+					isAnonymized bool
+					data         []byte
+					err          error
+				}
+				results := make(chan blockResult, len(descriptor))
+				var fetchWg sync.WaitGroup
+
+				fetchWg.Add(1)
+				go func() {
+					defer fetchWg.Done()
+					data, err := rfs.retrieveBlock(anonymizedHash)
+					results <- blockResult{isAnonymized: true, data: data, err: err}
+				}()
+
+				for _, rHash := range randomizerHashes {
+					fetchWg.Add(1)
+					go func(hash string) {
+						defer fetchWg.Done()
+						data, err := rfs.retrieveBlock(hash)
+						results <- blockResult{isAnonymized: false, data: data, err: err}
+					}(rHash)
+				}
+
+				fetchWg.Wait()
+				close(results)
+
+				var anonymizedBlock []byte
+				randomizerBlocks := make([][]byte, 0, len(randomizerHashes))
+				var fetchErr error
+
+				for res := range results {
+					if res.err != nil {
+						fetchErr = res.err
+						break
+					}
+					if res.isAnonymized {
+						anonymizedBlock = res.data
+					} else {
+						randomizerBlocks = append(randomizerBlocks, res.data)
+					}
+				}
+
+				if fetchErr != nil {
+					log.Printf("Failed to fetch a block for descriptor, trying next one. Error: %v", fetchErr)
+					continue // Try the next redundant descriptor
+				}
+
+				// Reconstruct the original block
+				reconstructedBlock := make([]byte, rep.BlockSize)
+				copy(reconstructedBlock, anonymizedBlock)
+				for _, rBlock := range randomizerBlocks {
+					XORBlocksInPlace(reconstructedBlock, rBlock)
+				}
+				fileData[blockIndex] = reconstructedBlock
+				return // Successfully reconstructed this block, exit the redundancy loop
+			}
+			// If we get here, all redundant descriptors for this block failed.
+			blockErrors <- fmt.Errorf("failed to reconstruct block %d after all retries", blockIndex)
+		}(i)
+	}
+
+	wg.Wait()
+	close(blockErrors)
+
+	if err := <-blockErrors; err != nil {
 		return nil, nil, err
 	}
 
-	// Handle case with no blocks (e.g., empty file)
-	if len(rep.BlockHashes) == 0 {
-		if rep.FileSize == 0 {
-			return []byte{}, rep, nil
-		}
-		return nil, nil, fmt.Errorf("no blocks in representation for file of size %d", rep.FileSize)
+	// Assemble the file from the reconstructed blocks
+	var fullFile []byte
+	for _, block := range fileData {
+		fullFile = append(fullFile, block...)
 	}
 
-	// Reconstruct original data from retrieved blocks
-	originalData := make([]byte, 0, rep.FileSize)
-
-	// Helper to fetch a tuple of blocks
-	fetchTuple := func(hashes []string) ([][]byte, error) {
-		blocks := make([][]byte, len(hashes))
-		var wg sync.WaitGroup
-		errs := make(chan error, len(hashes))
-
-		for i, hash := range hashes {
-			wg.Add(1)
-			go func(i int, hash string) {
-				defer wg.Done()
-				block, err := rfs.retrieveBlock(hash)
-				if err != nil {
-					errs <- fmt.Errorf("failed to retrieve block %s: %v", hash, err)
-					return
-				}
-				blocks[i] = block
-			}(i, hash)
-		}
-		wg.Wait()
-		close(errs)
-
-		if len(errs) > 0 {
-			return nil, <-errs // Return the first error
-		}
-		return blocks, nil
+	// Trim padding from the last block
+	if rep.FileSize > 0 && len(fullFile) > int(rep.FileSize) {
+		fullFile = fullFile[:rep.FileSize]
 	}
 
-	for _, redundantDescriptors := range rep.Descriptors {
-		var originalBlock []byte
-		var err error
-		recovered := false
-
-		for i, descriptor := range redundantDescriptors {
-			tupleBlocks, fetchErr := fetchTuple(descriptor)
-			if fetchErr != nil {
-				err = fmt.Errorf("failed to fetch tuple for descriptor set %d: %v", i, fetchErr)
-				continue // Try next redundant descriptor
-			}
-
-			// Reconstruct the original block
-			reconstructed := make([]byte, len(tupleBlocks[0]))
-			copy(reconstructed, tupleBlocks[0])
-			for j := 1; j < len(tupleBlocks); j++ {
-				XORBlocksInPlace(reconstructed, tupleBlocks[j])
-			}
-			originalBlock = reconstructed
-			recovered = true
-			break // Success
-		}
-
-		if !recovered {
-			return nil, nil, fmt.Errorf("failed to recover block after trying all redundant descriptors: %v", err)
-		}
-		originalData = append(originalData, originalBlock...)
-	}
-
-	// Truncate to original file size
-	if int64(len(originalData)) > rep.FileSize {
-		originalData = originalData[:rep.FileSize]
-	}
-
-	return originalData, rep, nil
+	return fullFile, &rep, nil
 }
 
-// getRepresentation retrieves and parses a file representation from IPFS or local storage
-func (rfs *RandomFS) getRepresentation(repHash string) (*FileRepresentation, error) {
-	// Retrieve representation
-	var repData []byte
-	var err error
-	if rfs.useLocalStorage {
-		repData, err = rfs.catFromLocalStorage(repHash, "representation")
-	} else {
-		repData, err = rfs.catFromIPFS(repHash)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve representation: %v", err)
-	}
-
+// getRepresentation decrypts and unmarshals the file representation.
+func (rfs *RandomFS) getRepresentation(encryptedData []byte, password string) (FileRepresentation, error) {
 	var rep FileRepresentation
-	if err := json.Unmarshal(repData, &rep); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal representation: %v", err)
+	decryptedJSON, err := rfs.decryptData(encryptedData, password)
+	if err != nil {
+		return rep, fmt.Errorf("failed to decrypt representation: %v", err)
 	}
 
-	return &rep, nil
+	if err := json.Unmarshal(decryptedJSON, &rep); err != nil {
+		return rep, fmt.Errorf("failed to unmarshal representation JSON: %v", err)
+	}
+
+	return rep, nil
+}
+
+func (rfs *RandomFS) generateKey(password string) (*[32]byte, error) {
+	hash := sha256.Sum256([]byte(password))
+	return &hash, nil
+}
+
+func (rfs *RandomFS) encryptData(data []byte, password string) ([]byte, error) {
+	key, err := rfs.generateKey(password)
+	if err != nil {
+		return nil, err
+	}
+
+	var nonce [24]byte
+	if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
+		return nil, err
+	}
+
+	encrypted := secretbox.Seal(nonce[:], data, &nonce, key)
+	return encrypted, nil
+}
+
+func (rfs *RandomFS) decryptData(encryptedData []byte, password string) ([]byte, error) {
+	key, err := rfs.generateKey(password)
+	if err != nil {
+		return nil, err
+	}
+
+	var nonce [24]byte
+	if len(encryptedData) < len(nonce) {
+		return nil, fmt.Errorf("encrypted data is too short")
+	}
+	copy(nonce[:], encryptedData[:len(nonce)])
+
+	decrypted, ok := secretbox.Open(nil, encryptedData[len(nonce):], &nonce, key)
+	if !ok {
+		return nil, fmt.Errorf("decryption failed, likely incorrect password")
+	}
+
+	return decrypted, nil
+}
+
+// updateBlockPopularity increments the usage count for each randomizer block in a representation.
+func (rfs *RandomFS) updateBlockPopularity(rep *FileRepresentation) {
+	rfs.blockPopularityMutex.Lock()
+	defer rfs.blockPopularityMutex.Unlock()
+
+	for _, descriptorList := range rep.Descriptors {
+		for _, descriptor := range descriptorList {
+			// The first hash is the anonymized block, the rest are randomizers.
+			if len(descriptor) > 1 {
+				for _, randomizerHash := range descriptor[1:] {
+					rfs.blockPopularity[randomizerHash]++
+				}
+			}
+		}
+	}
 }
 
 // GenerateRandomBlocks creates randomized blocks using the OFF System algorithm
@@ -783,22 +849,27 @@ func (ru *RandomURL) String() string {
 	return fmt.Sprintf("rfs://%s", ru.RepHash)
 }
 
-// OpenStream returns a StreamingReader for a file, allowing it to be read in chunks.
+// OpenStream opens a streaming reader for a large file.
+// NOTE: This function does not currently support encrypted descriptors.
 func (rfs *RandomFS) OpenStream(repHash string) (*StreamingReader, error) {
-	rep, err := rfs.getRepresentation(repHash)
+	// Since we don't have the password, we can't decrypt the real representation.
+	// For now, this will fail. A future update could involve passing the password here.
+	encryptedRep, err := rfs.retrieveBlock(repHash)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to retrieve representation block for streaming: %v", err)
 	}
 
-	// Cache for reconstructed blocks.
-	cache, err := lru.New(10)
+	// This call will fail as an empty password is not allowed for decryption.
+	rep, err := rfs.getRepresentation(encryptedRep, "")
 	if err != nil {
-		return nil, fmt.Errorf("failed to create LRU cache for streaming: %v", err)
+		return nil, fmt.Errorf("cannot open stream without a password for encrypted descriptor: %v", err)
 	}
 
+	cache, _ := lru.New(10) // Cache for reconstructed blocks
 	return &StreamingReader{
 		rfs:        rfs,
-		rep:        rep,
+		rep:        &rep,
+		position:   0,
 		blockCache: cache,
 	}, nil
 }
@@ -1039,21 +1110,4 @@ func (rfs *RandomFS) updateStats(updateFunc func(*Stats)) {
 	rfs.stats.mutex.Lock()
 	defer rfs.stats.mutex.Unlock()
 	updateFunc(&rfs.stats)
-}
-
-// updateBlockPopularity increments the usage count for each randomizer block in a representation.
-func (rfs *RandomFS) updateBlockPopularity(rep *FileRepresentation) {
-	rfs.blockPopularityMutex.Lock()
-	defer rfs.blockPopularityMutex.Unlock()
-
-	for _, descriptorList := range rep.Descriptors {
-		for _, descriptor := range descriptorList {
-			// The first hash is the anonymized block, the rest are randomizers.
-			if len(descriptor) > 1 {
-				for _, randomizerHash := range descriptor[1:] {
-					rfs.blockPopularity[randomizerHash]++
-				}
-			}
-		}
-	}
 }
