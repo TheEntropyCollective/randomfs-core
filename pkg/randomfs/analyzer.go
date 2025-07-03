@@ -3,12 +3,11 @@ package randomfs
 import (
 	"math"
 	"math/rand"
+	"sort"
 	"time"
 )
 
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
+var rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 // ContentAnalyzer provides tools for selecting optimal blocks.
 type ContentAnalyzer struct {
@@ -17,9 +16,13 @@ type ContentAnalyzer struct {
 
 // BlockCandidate represents a potential block to be used as a randomizer.
 type BlockCandidate struct {
-	Hash       string
-	Data       []byte
-	Popularity int
+	Hash           string
+	Data           []byte
+	Popularity     int
+	Age            time.Duration // How long since block was created
+	LastUsed       time.Time     // When block was last used for randomization
+	NetworkLatency time.Duration // Network latency to retrieve this block
+	Availability   float64       // Availability score (0-1)
 }
 
 // ScoredCandidate holds a candidate and its score.
@@ -46,58 +49,112 @@ func calculateEntropy(data []byte) float64 {
 	return entropy
 }
 
-// selectOptimalBlocks scores and selects the best randomizer blocks based on a hybrid strategy.
-// It uses weighted random selection to introduce unpredictability.
+// selectOptimalBlocks prioritizes blocks with high entropy and high popularity for optimal efficiency.
 func (ca *ContentAnalyzer) selectOptimalBlocks(candidates []BlockCandidate, count int, minEntropy float64) []BlockCandidate {
 	if len(candidates) == 0 {
 		return []BlockCandidate{}
 	}
 
-	// 1. Filter out candidates that don't meet the minimum entropy threshold.
-	highEntropyCandidates := make([]BlockCandidate, 0, len(candidates))
+	// If we have fewer candidates than requested, return all available.
+	if len(candidates) <= count {
+		return candidates
+	}
+
+	// Step 1: Score all candidates using OFF System criteria
+	scoredCandidates := make([]ScoredCandidate, 0, len(candidates))
 	for _, c := range candidates {
-		if calculateEntropy(c.Data) >= minEntropy {
-			highEntropyCandidates = append(highEntropyCandidates, c)
+		score := 0.0
+
+		entropy := calculateEntropy(c.Data)
+		// Entropy component (0-1 scale) - Primary factor
+		entropyScore := math.Min(entropy/8.0, 1.0)
+		score += entropyScore * 0.4 // 40% weight for entropy
+
+		// Popularity bonus (direct relationship for efficiency)
+		popularityBonus := float64(c.Popularity) / (1.0 + float64(c.Popularity))
+		score += popularityBonus * 0.25 // 25% weight for popularity
+
+		// Network performance factors
+		availabilityScore := c.Availability
+		score += availabilityScore * 0.2 // 20% weight for availability
+
+		// Latency penalty (lower latency = higher score)
+		latencyScore := 1.0 / (1.0 + c.NetworkLatency.Seconds())
+		score += latencyScore * 0.1 // 10% weight for network speed
+
+		// Age factor (prefer blocks that aren't too old or too new)
+		ageHours := c.Age.Hours()
+		ageFactor := 1.0
+		if ageHours < 1 {
+			ageFactor = 0.5 // Too new, might not be well-distributed
+		} else if ageHours > 168 { // 1 week
+			ageFactor = 0.7 // Older blocks might be less available
 		}
+		score *= ageFactor
+
+		// Recency bonus (recently used blocks are likely still cached)
+		timeSinceLastUse := time.Since(c.LastUsed).Hours()
+		if timeSinceLastUse < 24 { // Used within last day
+			score += 0.05 // 5% bonus for cache efficiency
+		}
+
+		// Apply minimum entropy threshold
+		if entropy < minEntropy {
+			score *= 0.1 // Severely penalize low entropy blocks
+		}
+
+		scoredCandidates = append(scoredCandidates, ScoredCandidate{
+			Candidate: c,
+			Score:     score,
+		})
 	}
 
-	// If filtering left us with too few candidates, we can't do a weighted selection.
-	// We'll just return what we have (up to the requested count).
-	if len(highEntropyCandidates) <= count {
-		return highEntropyCandidates
-	}
+	// Step 2: Sort by score (highest first)
+	sort.Slice(scoredCandidates, func(i, j int) bool {
+		return scoredCandidates[i].Score > scoredCandidates[j].Score
+	})
 
-	// 2. Perform weighted random selection without replacement.
+	// Step 3: Select top candidates with some randomization
 	selectedBlocks := make([]BlockCandidate, 0, count)
-	for i := 0; i < count; i++ {
-		// Calculate total popularity weight of remaining candidates
-		totalWeight := 0
-		for _, c := range highEntropyCandidates {
-			// Add 1 to popularity to ensure even unpopular blocks have a chance.
-			totalWeight += c.Popularity + 1
-		}
 
-		if totalWeight == 0 {
-			// This case should be rare, but if all remaining candidates have 0 popularity,
-			// we fall back to a simple random selection from the high-entropy pool.
-			idx := rand.Intn(len(highEntropyCandidates))
-			selectedBlocks = append(selectedBlocks, highEntropyCandidates[idx])
-			// Remove selected element
-			highEntropyCandidates = append(highEntropyCandidates[:idx], highEntropyCandidates[idx+1:]...)
-			continue
-		}
+	// Take the top 70% deterministically, randomize the rest
+	deterministicCount := int(float64(count) * 0.7)
+	randomCount := count - deterministicCount
 
-		// Choose a random number within the total weight
-		r := rand.Intn(totalWeight)
+	// Add deterministic selections
+	for i := 0; i < deterministicCount && i < len(scoredCandidates); i++ {
+		selectedBlocks = append(selectedBlocks, scoredCandidates[i].Candidate)
+	}
 
-		// Find the candidate corresponding to the random number
-		for j, c := range highEntropyCandidates {
-			r -= (c.Popularity + 1)
-			if r < 0 {
-				selectedBlocks = append(selectedBlocks, c)
-				// Remove the selected candidate for the next round (selection without replacement)
-				highEntropyCandidates = append(highEntropyCandidates[:j], highEntropyCandidates[j+1:]...)
-				break
+	// Add randomized selections from remaining candidates
+	if randomCount > 0 && len(scoredCandidates) > deterministicCount {
+		remainingCandidates := scoredCandidates[deterministicCount:]
+
+		// Weighted random selection from remaining candidates
+		for i := 0; i < randomCount && len(remainingCandidates) > 0; i++ {
+			// Calculate total weight
+			totalWeight := 0.0
+			for _, sc := range remainingCandidates {
+				totalWeight += sc.Score
+			}
+
+			if totalWeight == 0 {
+				// Fall back to uniform random selection
+				idx := rng.Intn(len(remainingCandidates))
+				selectedBlocks = append(selectedBlocks, remainingCandidates[idx].Candidate)
+				remainingCandidates = append(remainingCandidates[:idx], remainingCandidates[idx+1:]...)
+				continue
+			}
+
+			// Weighted random selection
+			r := rng.Float64() * totalWeight
+			for j, sc := range remainingCandidates {
+				r -= sc.Score
+				if r < 0 {
+					selectedBlocks = append(selectedBlocks, sc.Candidate)
+					remainingCandidates = append(remainingCandidates[:j], remainingCandidates[j+1:]...)
+					break
+				}
 			}
 		}
 	}
