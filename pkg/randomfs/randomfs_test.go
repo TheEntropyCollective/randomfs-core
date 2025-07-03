@@ -446,7 +446,6 @@ func TestBlockCandidatePopulation(t *testing.T) {
 		// Calculate all metadata (similar to selectRandomizerBlocks)
 		rfs.blockMetadataMutex.RLock()
 		creationTime, hasCreationTime := rfs.blockCreationTime[hash]
-		lastUsed, hasLastUsed := rfs.blockLastUsed[hash]
 		rfs.blockMetadataMutex.RUnlock()
 
 		var age time.Duration
@@ -454,10 +453,7 @@ func TestBlockCandidatePopulation(t *testing.T) {
 			age = time.Since(creationTime)
 		}
 
-		var lastUsedTime time.Time
-		if hasLastUsed {
-			lastUsedTime = lastUsed
-		}
+		// Note: LastUsed field not used in this test
 
 		avgLatency := rfs.calculateAverageLatency(hash)
 		availability := rfs.calculateAvailabilityScore(hash)
@@ -467,7 +463,6 @@ func TestBlockCandidatePopulation(t *testing.T) {
 			Data:           data,
 			Popularity:     rfs.blockPopularity[hash],
 			Age:            age,
-			LastUsed:       lastUsedTime,
 			NetworkLatency: avgLatency,
 			Availability:   availability,
 		}

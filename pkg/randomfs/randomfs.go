@@ -272,6 +272,15 @@ func (rfs *RandomFS) GetStats() Stats {
 	}
 }
 
+// GetNetworkStats returns network statistics (simplified for natural sharing)
+func (rfs *RandomFS) GetNetworkStats() map[string]interface{} {
+	return map[string]interface{}{
+		"enabled":      false,
+		"sharing_mode": "natural",
+		"description":  "Using IPFS natural deduplication for block sharing",
+	}
+}
+
 // testIPFSConnection tests if IPFS daemon is accessible
 func (rfs *RandomFS) testIPFSConnection() error {
 	resp, err := http.Post(rfs.ipfsAPI+"/api/v0/version", "application/json", nil)
@@ -912,19 +921,21 @@ func splitIntoBlocks(data []byte, blockSize int) [][]byte {
 }
 
 // selectRandomizerBlocks selects existing blocks to be used as randomizers
-// and generates new ones if not enough are available. It uses a content analyzer
-// to pick the best candidates for reuse.
+// and generates new ones if not enough are available. It prioritizes
+// reusing existing blocks from local storage for efficiency.
 func (rfs *RandomFS) selectRandomizerBlocks(count int, blockSize int) (blocks [][]byte, reusedCount int, err error) {
-	// 1. Get a pool of candidates from the block index.
-	const maxCandidates = 20 // Analyze up to 20 candidates for performance.
-	candidateHashes := rfs.selectRandomizerHashes(maxCandidates)
+	// Get local candidates from the block index
+	const maxLocalCandidates = 20
+	candidateHashes := rfs.selectRandomizerHashes(maxLocalCandidates)
 
 	rfs.blockPopularityMutex.Lock()
 	defer rfs.blockPopularityMutex.Unlock()
 
-	candidates := make([]BlockCandidate, 0, len(candidateHashes))
+	candidates := make([]BlockCandidate, 0, maxLocalCandidates)
+
+	// Build candidates with metadata for intelligent selection
 	for _, hash := range candidateHashes {
-		data, err := rfs.retrieveBlock(hash) // This uses the cache, so it should be fast.
+		data, err := rfs.retrieveBlock(hash)
 		if err == nil {
 			// Calculate block age
 			rfs.blockMetadataMutex.RLock()
@@ -942,7 +953,7 @@ func (rfs *RandomFS) selectRandomizerBlocks(count int, blockSize int) (blocks []
 				lastUsedTime = lastUsed
 			}
 
-			// Get network performance metrics
+			// Get performance metrics
 			avgLatency := rfs.calculateAverageLatency(hash)
 			availability := rfs.calculateAvailabilityScore(hash)
 
@@ -960,17 +971,17 @@ func (rfs *RandomFS) selectRandomizerBlocks(count int, blockSize int) (blocks []
 
 	var selectedBlocks [][]byte
 
-	// 2. If we have candidates, use the analyzer to select the best ones.
+	// Use intelligent selection if we have candidates
 	if len(candidates) > 0 {
 		numToSelect := count
 		if len(candidates) < count {
 			numToSelect = len(candidates)
 		}
-		// Use the hybrid selection strategy.
+		// Use the analyzer to select optimal blocks based on entropy and performance
 		optimalCandidates := rfs.analyzer.selectOptimalBlocks(candidates, numToSelect, MinEntropyThreshold)
 		for _, c := range optimalCandidates {
 			selectedBlocks = append(selectedBlocks, c.Data)
-			// Mark block as recently used for future scoring
+			// Mark block as recently used
 			rfs.updateBlockLastUsed(c.Hash)
 		}
 	}
@@ -980,9 +991,10 @@ func (rfs *RandomFS) selectRandomizerBlocks(count int, blockSize int) (blocks []
 		rfs.updateStats(func(s *Stats) {
 			s.BlocksReused += int64(reusedCount)
 		})
+		log.Printf("Reused %d blocks from local storage", reusedCount)
 	}
 
-	// 3. Generate new random blocks if we don't have enough.
+	// Generate new random blocks if we don't have enough
 	for len(selectedBlocks) < count {
 		newBlock := make([]byte, blockSize)
 		if _, err := rand.Read(newBlock); err != nil {
@@ -1141,4 +1153,17 @@ func (rfs *RandomFS) updateBlockLastUsed(hash string) {
 	rfs.blockMetadataMutex.Lock()
 	defer rfs.blockMetadataMutex.Unlock()
 	rfs.blockLastUsed[hash] = time.Now()
+}
+
+// Close gracefully shuts down the RandomFS instance
+func (rfs *RandomFS) Close() {
+	// Clean shutdown - no P2P networking to stop
+}
+
+// Helper function for min
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
