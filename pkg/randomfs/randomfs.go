@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	mrand "math/rand"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -49,6 +50,8 @@ type RandomFS struct {
 	mutex            sync.RWMutex
 	useLocalStorage  bool
 	RedundancyFactor int
+	blockIndex       []string
+	blockIndexMutex  sync.Mutex
 
 	// Statistics
 	stats Stats
@@ -64,6 +67,7 @@ type Stats struct {
 	BlockRetrievalFailures int64         `json:"block_retrieval_failures"`
 	TotalRetrievalLatency  time.Duration `json:"total_retrieval_latency"`
 	SuccessfulRetrievals   int64         `json:"successful_retrievals"`
+	BlocksReused           int64         `json:"blocks_reused"`
 	mutex                  sync.Mutex
 }
 
@@ -229,6 +233,12 @@ func NewRandomFSWithOptions(ipfsAPI string, dataDir string, cacheSize int64, ski
 		dataDir:          dataDir,
 		useLocalStorage:  skipIPFSTest,
 		RedundancyFactor: 2, // Default redundancy factor
+		blockIndex:       make([]string, 0),
+	}
+
+	// Load existing block hashes into the index if using local storage
+	if skipIPFSTest {
+		go rfs.loadBlockIndex()
 	}
 
 	// Initialize smart cache
@@ -264,6 +274,7 @@ func (rfs *RandomFS) GetStats() Stats {
 		BlockRetrievalFailures: rfs.stats.BlockRetrievalFailures,
 		TotalRetrievalLatency:  rfs.stats.TotalRetrievalLatency,
 		SuccessfulRetrievals:   rfs.stats.SuccessfulRetrievals,
+		BlocksReused:           rfs.stats.BlocksReused,
 	}
 }
 
@@ -299,14 +310,14 @@ func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string)
 	for _, originalBlock := range originalBlocks {
 		var redundantDescriptors [][]string
 		for r := 0; r < rfs.RedundancyFactor; r++ {
-			// Create a new set of randomizer blocks for each redundant copy
-			randomizers := make([][]byte, TupleSize-1)
-			for i := range randomizers {
-				randomizers[i] = make([]byte, blockSize)
-				if _, err := rand.Read(randomizers[i]); err != nil {
-					return nil, fmt.Errorf("failed to generate randomizer block: %v", err)
-				}
+			// Select randomizer blocks, reusing if possible.
+			randomizers, reusedCount, err := rfs.selectRandomizerBlocks(TupleSize-1, blockSize)
+			if err != nil {
+				return nil, fmt.Errorf("failed to select randomizer blocks: %v", err)
 			}
+			rfs.stats.mutex.Lock()
+			rfs.stats.BlocksReused += int64(reusedCount)
+			rfs.stats.mutex.Unlock()
 
 			// Create the anonymized block
 			anonymizedBlock := make([]byte, blockSize)
@@ -315,7 +326,8 @@ func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string)
 				XORBlocksInPlace(anonymizedBlock, rando)
 			}
 
-			// Store all blocks of the tuple
+			// Store all blocks of the tuple.
+			// This now includes storing the new randomizers that were generated.
 			tuple := append([][]byte{anonymizedBlock}, randomizers...)
 			tupleHashes := make([]string, len(tuple))
 			for i, block := range tuple {
@@ -584,6 +596,11 @@ func (rfs *RandomFS) storeBlock(block []byte) (string, error) {
 
 	// Add to cache
 	rfs.blockCache.Put(hash, block)
+
+	// Add to block index for reuse
+	rfs.blockIndexMutex.Lock()
+	rfs.blockIndex = append(rfs.blockIndex, hash)
+	rfs.blockIndexMutex.Unlock()
 
 	return hash, nil
 }
@@ -902,4 +919,75 @@ func splitIntoBlocks(data []byte, blockSize int) [][]byte {
 		blocks = append(blocks, chunk)
 	}
 	return blocks
+}
+
+// selectRandomizerBlocks selects existing blocks to be used as randomizers
+// and generates new ones if not enough are available.
+func (rfs *RandomFS) selectRandomizerBlocks(count int, blockSize int) (blocks [][]byte, reusedCount int, err error) {
+	hashesToFetch := rfs.selectRandomizerHashes(count)
+	reusedCount = len(hashesToFetch)
+
+	// Fetch the blocks for the reused hashes
+	for _, hash := range hashesToFetch {
+		blockData, err := rfs.retrieveBlock(hash)
+		if err != nil {
+			// If a reused block fails, we could generate a new one instead.
+			// For simplicity, we'll return an error for now.
+			return nil, 0, fmt.Errorf("failed to retrieve reused block %s: %v", hash, err)
+		}
+		blocks = append(blocks, blockData)
+	}
+
+	// Generate new random blocks if we don't have enough
+	for len(blocks) < count {
+		newBlock := make([]byte, blockSize)
+		if _, err := rand.Read(newBlock); err != nil {
+			return nil, 0, fmt.Errorf("failed to generate new randomizer block: %v", err)
+		}
+		blocks = append(blocks, newBlock)
+	}
+
+	return blocks, reusedCount, nil
+}
+
+// selectRandomizerHashes randomly selects unique block hashes from the index.
+func (rfs *RandomFS) selectRandomizerHashes(count int) []string {
+	rfs.blockIndexMutex.Lock()
+	defer rfs.blockIndexMutex.Unlock()
+
+	if len(rfs.blockIndex) == 0 {
+		return []string{}
+	}
+
+	numToPick := count
+	if len(rfs.blockIndex) < count {
+		numToPick = len(rfs.blockIndex)
+	}
+
+	// Shuffle indices to pick random, unique blocks.
+	indices := mrand.Perm(len(rfs.blockIndex))
+	pickedHashes := make([]string, numToPick)
+	for i := 0; i < numToPick; i++ {
+		pickedHashes[i] = rfs.blockIndex[indices[i]]
+	}
+	return pickedHashes
+}
+
+// loadBlockIndex populates the block index from the local storage directory on startup.
+func (rfs *RandomFS) loadBlockIndex() {
+	blocksDir := filepath.Join(rfs.dataDir, "blocks")
+	entries, err := os.ReadDir(blocksDir)
+	if err != nil {
+		log.Printf("Warning: could not read blocks directory to populate index: %v", err)
+		return
+	}
+
+	rfs.blockIndexMutex.Lock()
+	defer rfs.blockIndexMutex.Unlock()
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			rfs.blockIndex = append(rfs.blockIndex, entry.Name())
+		}
+	}
+	log.Printf("Loaded %d block hashes into index from local storage.", len(rfs.blockIndex))
 }

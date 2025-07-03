@@ -298,3 +298,32 @@ func TestNetworkHealthMonitoring(t *testing.T) {
 		t.Error("Expected block retrieval failures to increase, but it did not.")
 	}
 }
+
+// TestBlockReuse tests that blocks are reused when storing multiple files.
+func TestBlockReuse(t *testing.T) {
+	rfs, _, teardown := setupTestFS(t)
+	defer teardown()
+
+	// Store the first file to populate the system with blocks.
+	_, err := rfs.StoreFile("file1.txt", []byte("some initial data for file 1"), "text/plain")
+	if err != nil {
+		t.Fatalf("StoreFile failed for file1: %v", err)
+	}
+
+	// The first file may reuse blocks within its own storage process.
+	statsAfterFirst := rfs.GetStats()
+
+	// Store a second file, which should reuse blocks from the first.
+	_, err = rfs.StoreFile("file2.txt", []byte("some different data for file 2"), "text/plain")
+	if err != nil {
+		t.Fatalf("StoreFile failed for file2: %v", err)
+	}
+
+	statsAfterSecond := rfs.GetStats()
+	if statsAfterSecond.BlocksReused <= statsAfterFirst.BlocksReused {
+		t.Errorf("Expected block reuse count to increase after storing a second file. First: %d, Second: %d",
+			statsAfterFirst.BlocksReused, statsAfterSecond.BlocksReused)
+	}
+	t.Logf("Successfully reused blocks. Count after first file: %d, after second: %d.",
+		statsAfterFirst.BlocksReused, statsAfterSecond.BlocksReused)
+}
