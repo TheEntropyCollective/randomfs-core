@@ -325,8 +325,10 @@ func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string,
 		Descriptors: make([][][]string, len(blocks)),
 	}
 
+	// Collect all blocks to be stored in a batch
+	var allBlocks [][]byte
+
 	for i, block := range blocks {
-		var blockDescriptors [][]string
 		for j := 0; j < rfs.RedundancyFactor; j++ {
 			// In each redundancy round, we anonymize
 			// the original block with a set of other random blocks.
@@ -335,29 +337,50 @@ func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string,
 				return "", fmt.Errorf("failed to select randomizer blocks for block %d: %v", i, err)
 			}
 
+			// Add randomizer blocks to the batch
+			for _, rBlock := range randomizerBlocks {
+				allBlocks = append(allBlocks, rBlock)
+			}
+
 			// The last block in the tuple is the XOR sum of the original block and the randomizers.
 			// To get the anonymized block, we start with the original data.
 			anonymizedBlock := make([]byte, len(block))
 			copy(anonymizedBlock, block)
 
-			var descriptor []string
+			// XOR with all randomizer blocks
 			for _, rBlock := range randomizerBlocks {
-				// Store the randomizer block and add its hash to the descriptor.
-				rHash, err := rfs.storeBlock(rBlock)
-				if err != nil {
-					return "", fmt.Errorf("failed to store randomizer block: %v", err)
-				}
-				descriptor = append(descriptor, rHash)
 				XORBlocksInPlace(anonymizedBlock, rBlock)
 			}
 
-			// Now, store the final anonymized block.
-			anonymizedHash, err := rfs.storeBlock(anonymizedBlock)
-			if err != nil {
-				return "", fmt.Errorf("failed to store anonymized block: %v", err)
+			// Add anonymized block to the batch
+			allBlocks = append(allBlocks, anonymizedBlock)
+		}
+	}
+
+	// Store all blocks in a batch
+	allHashes, err := rfs.StoreAndIndexBlocks(allBlocks)
+	if err != nil {
+		return "", fmt.Errorf("failed to batch store blocks: %v", err)
+	}
+
+	// Build descriptors using the returned hashes
+	hashIndex := 0
+	for i := range blocks {
+		var blockDescriptors [][]string
+		for j := 0; j < rfs.RedundancyFactor; j++ {
+			var descriptor []string
+
+			// Add randomizer hashes
+			for k := 0; k < TupleSize-1; k++ {
+				descriptor = append(descriptor, allHashes[hashIndex])
+				hashIndex++
 			}
-			// Prepend the anonymized hash to the start of the descriptor.
+
+			// Add anonymized hash at the beginning
+			anonymizedHash := allHashes[hashIndex]
 			descriptor = append([]string{anonymizedHash}, descriptor...)
+			hashIndex++
+
 			blockDescriptors = append(blockDescriptors, descriptor)
 		}
 		rep.Descriptors[i] = blockDescriptors
@@ -694,6 +717,45 @@ func (rfs *RandomFS) storeBlock(block []byte) (string, error) {
 	return hash, nil
 }
 
+// StoreAndIndexBlocks stores multiple blocks in a batch and returns their hashes
+func (rfs *RandomFS) StoreAndIndexBlocks(blocks [][]byte) ([]string, error) {
+	if len(blocks) == 0 {
+		return []string{}, nil
+	}
+
+	var hashes []string
+	var err error
+
+	if rfs.useLocalStorage {
+		// For local storage, we still need to store blocks individually
+		// since local storage doesn't support batch operations
+		hashes = make([]string, len(blocks))
+		for i, block := range blocks {
+			hash, err := rfs.addToLocalStorage(block, "block")
+			if err != nil {
+				return nil, fmt.Errorf("failed to store block %d: %v", i, err)
+			}
+			hashes[i] = hash
+		}
+	} else {
+		// For IPFS, use batch upload
+		hashes, err = rfs.addManyToIPFS(blocks)
+		if err != nil {
+			return nil, fmt.Errorf("failed to batch store blocks: %v", err)
+		}
+	}
+
+	// Add all blocks to cache and index
+	rfs.blockIndexMutex.Lock()
+	for i, hash := range hashes {
+		rfs.blockCache.Put(hash, blocks[i])
+		rfs.blockIndex = append(rfs.blockIndex, hash)
+	}
+	rfs.blockIndexMutex.Unlock()
+
+	return hashes, nil
+}
+
 // retrieveBlock retrieves a block from the cache or IPFS
 func (rfs *RandomFS) retrieveBlock(hash string) ([]byte, error) {
 	startTime := time.Now()
@@ -722,43 +784,132 @@ func (rfs *RandomFS) selectBlockSize(fileSize int64) int {
 	return BlockSize
 }
 
-// addToIPFS adds data to IPFS using HTTP API
+// addToIPFS adds data to IPFS and returns the hash
 func (rfs *RandomFS) addToIPFS(data []byte) (string, error) {
+	// Create a multipart form
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
 
+	// Create a form file
 	part, err := writer.CreateFormFile("file", "data")
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to create form file: %v", err)
 	}
 
+	// Write the data to the form file
 	if _, err := part.Write(data); err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to write data to form: %v", err)
 	}
 
+	// Close the writer
 	if err := writer.Close(); err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to close writer: %v", err)
 	}
 
-	resp, err := http.Post(rfs.ipfsAPI+"/api/v0/add", writer.FormDataContentType(), &buf)
+	// Create the request
+	url := fmt.Sprintf("%s/api/v0/add", rfs.ipfsAPI)
+	req, err := http.NewRequest("POST", url, &buf)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to create request: %v", err)
+	}
+
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	// Send the request
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send request: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("IPFS add failed with status: %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("IPFS API returned status %d: %s", resp.StatusCode, string(body))
 	}
 
+	// Parse the response
 	var result struct {
 		Hash string `json:"Hash"`
+		Name string `json:"Name"`
+		Size string `json:"Size"`
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to decode response: %v", err)
 	}
 
 	return result.Hash, nil
+}
+
+// addManyToIPFS adds multiple blocks to IPFS in a single request and returns their hashes
+func (rfs *RandomFS) addManyToIPFS(blocks [][]byte) ([]string, error) {
+	// Create a multipart form
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+
+	// Add each block as a separate form file
+	for i, block := range blocks {
+		part, err := writer.CreateFormFile("file", fmt.Sprintf("block_%d", i))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create form file for block %d: %v", i, err)
+		}
+
+		if _, err := part.Write(block); err != nil {
+			return nil, fmt.Errorf("failed to write block %d to form: %v", i, err)
+		}
+	}
+
+	// Close the writer
+	if err := writer.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close writer: %v", err)
+	}
+
+	// Create the request
+	url := fmt.Sprintf("%s/api/v0/add", rfs.ipfsAPI)
+	req, err := http.NewRequest("POST", url, &buf)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %v", err)
+	}
+
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	// Send the request
+	client := &http.Client{Timeout: 60 * time.Second} // Longer timeout for batch operations
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("IPFS API returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Parse the streaming response - IPFS returns one JSON object per line
+	var hashes []string
+	decoder := json.NewDecoder(resp.Body)
+
+	for decoder.More() {
+		var result struct {
+			Hash string `json:"Hash"`
+			Name string `json:"Name"`
+			Size string `json:"Size"`
+		}
+
+		if err := decoder.Decode(&result); err != nil {
+			return nil, fmt.Errorf("failed to decode response: %v", err)
+		}
+
+		hashes = append(hashes, result.Hash)
+	}
+
+	if len(hashes) != len(blocks) {
+		return nil, fmt.Errorf("expected %d hashes, got %d", len(blocks), len(hashes))
+	}
+
+	return hashes, nil
 }
 
 // catFromIPFS retrieves data from IPFS using HTTP API

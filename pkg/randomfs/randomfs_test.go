@@ -133,38 +133,101 @@ func TestRedundancyRecoveryWithEncryption(t *testing.T) {
 }
 
 func TestCoverTraffic(t *testing.T) {
-	rfs, _, teardown := setupTestFS(t)
-	defer teardown()
+	rfs, err := NewRandomFSWithoutIPFS(t.TempDir(), 1000)
+	if err != nil {
+		t.Fatalf("Failed to create RandomFS: %v", err)
+	}
 
-	// Store a file to ensure there are blocks in the index to be used as decoys.
-	testData := []byte("some data to test cover traffic")
-	repHash, err := rfs.StoreFile("cover_traffic.txt", testData, "text/plain", testPassword)
+	// Store a file
+	testData := []byte("This is test data for cover traffic verification")
+	repHash, err := rfs.StoreFile("test.txt", testData, "text/plain", "testpassword")
 	if err != nil {
 		t.Fatalf("Failed to store file: %v", err)
 	}
 
-	// Wait a moment for the block index to be populated from the initial storage.
-	// This is a simplification for the test; in reality, the index is updated in real-time.
-	initialStats := rfs.GetStats()
-
-	// Retrieve the file. This should trigger decoy block fetching.
-	_, rep, err := rfs.RetrieveFile(repHash, testPassword)
+	// Retrieve the file and count successful retrievals
+	_, rep, err := rfs.RetrieveFile(repHash, "testpassword")
 	if err != nil {
 		t.Fatalf("Failed to retrieve file: %v", err)
 	}
 
-	finalStats := rfs.GetStats()
-
-	// Calculate the number of legitimate blocks that should have been fetched.
-	// For this test, we assume no failures, so it's the number of blocks per descriptor.
-	legitBlocks := len(rep.Descriptors) * TupleSize
-
-	// The total number of successful retrievals should be the sum of legitimate blocks and decoy blocks.
-	// We expect the number of retrievals to be greater than just the legitimate blocks.
-	totalRetrievals := finalStats.SuccessfulRetrievals - initialStats.SuccessfulRetrievals
-	if totalRetrievals <= int64(legitBlocks) {
-		t.Errorf("Expected cover traffic to increase retrieval count beyond legitimate blocks. Got %d total retrievals, expected > %d", totalRetrievals, legitBlocks)
+	// Count legitimate blocks (anonymized + randomizer blocks)
+	legitimateBlocks := 0
+	for _, blockDescriptors := range rep.Descriptors {
+		for _, descriptor := range blockDescriptors {
+			legitimateBlocks += len(descriptor)
+		}
 	}
 
-	t.Logf("Successfully verified cover traffic. Legitimate blocks: %d, Total retrievals: %d", legitBlocks, totalRetrievals)
+	// Get stats to see total retrievals
+	stats := rfs.GetStats()
+	totalRetrievals := stats.SuccessfulRetrievals
+
+	// Verify that we have more total retrievals than legitimate blocks
+	// (indicating cover traffic was generated)
+	if totalRetrievals <= int64(legitimateBlocks) {
+		t.Errorf("Cover traffic not working. Legitimate blocks: %d, Total retrievals: %d", legitimateBlocks, totalRetrievals)
+	} else {
+		t.Logf("Successfully verified cover traffic. Legitimate blocks: %d, Total retrievals: %d", legitimateBlocks, totalRetrievals)
+	}
+}
+
+func TestBatchOperations(t *testing.T) {
+	rfs, err := NewRandomFSWithoutIPFS(t.TempDir(), 1000)
+	if err != nil {
+		t.Fatalf("Failed to create RandomFS: %v", err)
+	}
+
+	// Test data
+	testData := []byte("This is test data for batch operations verification. It should be large enough to create multiple blocks.")
+
+	// Store file using batch operations
+	repHash, err := rfs.StoreFile("batch_test.txt", testData, "text/plain", "testpassword")
+	if err != nil {
+		t.Fatalf("Failed to store file with batch operations: %v", err)
+	}
+
+	// Retrieve the file
+	retrievedData, rep, err := rfs.RetrieveFile(repHash, "testpassword")
+	if err != nil {
+		t.Fatalf("Failed to retrieve file: %v", err)
+	}
+
+	// Verify data integrity
+	if !bytes.Equal(testData, retrievedData) {
+		t.Errorf("Data integrity check failed. Original: %d bytes, Retrieved: %d bytes", len(testData), len(retrievedData))
+	}
+
+	// Verify that descriptors are properly structured
+	for i, blockDescriptors := range rep.Descriptors {
+		if len(blockDescriptors) == 0 {
+			t.Errorf("Block %d has no descriptors", i)
+			continue
+		}
+
+		for j, descriptor := range blockDescriptors {
+			if len(descriptor) != TupleSize {
+				t.Errorf("Block %d, descriptor %d has wrong size. Expected %d, got %d", i, j, TupleSize, len(descriptor))
+			}
+
+			// Verify that the first hash is the anonymized block
+			// and the rest are randomizer blocks
+			if len(descriptor) > 0 {
+				anonymizedHash := descriptor[0]
+				randomizerHashes := descriptor[1:]
+
+				if anonymizedHash == "" {
+					t.Errorf("Block %d, descriptor %d has empty anonymized hash", i, j)
+				}
+
+				for k, rHash := range randomizerHashes {
+					if rHash == "" {
+						t.Errorf("Block %d, descriptor %d, randomizer %d has empty hash", i, j, k)
+					}
+				}
+			}
+		}
+	}
+
+	t.Logf("Successfully tested batch operations. File size: %d bytes, Blocks: %d", len(testData), len(rep.Descriptors))
 }
