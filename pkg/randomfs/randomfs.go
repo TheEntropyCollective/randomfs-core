@@ -40,19 +40,27 @@ const (
 	// TupleSize defines the number of blocks in an OFFSystem tuple.
 	// This includes the anonymized block and its randomizer blocks.
 	TupleSize = 3
+
+	// DefaultBlockSize is the standard size for content blocks.
+	DefaultBlockSize = 128 * 1024 // 128 KiB
+
+	// MinEntropyThreshold is the minimum Shannon entropy a block must have to be considered for reuse.
+	MinEntropyThreshold = 7.0
 )
 
 // RandomFS represents the main filesystem instance
 type RandomFS struct {
-	ipfsAPI          string
-	dataDir          string
-	blockCache       *SmartBlockCache
-	mutex            sync.RWMutex
-	useLocalStorage  bool
-	RedundancyFactor int
-	blockIndex       []string
-	blockIndexMutex  sync.Mutex
-	analyzer         *ContentAnalyzer
+	ipfsAPI              string
+	dataDir              string
+	blockCache           *SmartBlockCache
+	mutex                sync.RWMutex
+	useLocalStorage      bool
+	RedundancyFactor     int
+	blockIndex           []string
+	blockIndexMutex      sync.Mutex
+	analyzer             *ContentAnalyzer
+	blockPopularity      map[string]int
+	blockPopularityMutex sync.Mutex
 
 	// Statistics
 	stats Stats
@@ -236,6 +244,7 @@ func NewRandomFSWithOptions(ipfsAPI string, dataDir string, cacheSize int64, ski
 		RedundancyFactor: 2, // Default redundancy factor
 		blockIndex:       make([]string, 0),
 		analyzer:         &ContentAnalyzer{},
+		blockPopularity:  make(map[string]int),
 	}
 
 	// Load existing block hashes into the index if using local storage
@@ -372,6 +381,9 @@ func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string)
 	if err != nil {
 		return nil, fmt.Errorf("failed to store representation: %v", err)
 	}
+
+	// Update popularity counts for all reused randomizer blocks
+	rfs.updateBlockPopularity(rep)
 
 	// Update statistics
 	rfs.stats.mutex.Lock()
@@ -931,11 +943,18 @@ func (rfs *RandomFS) selectRandomizerBlocks(count int, blockSize int) (blocks []
 	const maxCandidates = 20 // Analyze up to 20 candidates for performance.
 	candidateHashes := rfs.selectRandomizerHashes(maxCandidates)
 
+	rfs.blockPopularityMutex.Lock()
+	defer rfs.blockPopularityMutex.Unlock()
+
 	candidates := make([]BlockCandidate, 0, len(candidateHashes))
 	for _, hash := range candidateHashes {
 		data, err := rfs.retrieveBlock(hash) // This uses the cache, so it should be fast.
 		if err == nil {
-			candidates = append(candidates, BlockCandidate{Hash: hash, Data: data})
+			candidates = append(candidates, BlockCandidate{
+				Hash:       hash,
+				Data:       data,
+				Popularity: rfs.blockPopularity[hash], // Get popularity
+			})
 		}
 	}
 
@@ -947,9 +966,8 @@ func (rfs *RandomFS) selectRandomizerBlocks(count int, blockSize int) (blocks []
 		if len(candidates) < count {
 			numToSelect = len(candidates)
 		}
-		// Note: The original block data is not passed here yet. The current strategy
-		// is to just pick the highest entropy blocks.
-		optimalCandidates := rfs.analyzer.selectOptimalBlocks(candidates, numToSelect)
+		// Use the hybrid selection strategy.
+		optimalCandidates := rfs.analyzer.selectOptimalBlocks(candidates, numToSelect, MinEntropyThreshold)
 		for _, c := range optimalCandidates {
 			selectedBlocks = append(selectedBlocks, c.Data)
 		}
@@ -1021,4 +1039,21 @@ func (rfs *RandomFS) updateStats(updateFunc func(*Stats)) {
 	rfs.stats.mutex.Lock()
 	defer rfs.stats.mutex.Unlock()
 	updateFunc(&rfs.stats)
+}
+
+// updateBlockPopularity increments the usage count for each randomizer block in a representation.
+func (rfs *RandomFS) updateBlockPopularity(rep *FileRepresentation) {
+	rfs.blockPopularityMutex.Lock()
+	defer rfs.blockPopularityMutex.Unlock()
+
+	for _, descriptorList := range rep.Descriptors {
+		for _, descriptor := range descriptorList {
+			// The first hash is the anonymized block, the rest are randomizers.
+			if len(descriptor) > 1 {
+				for _, randomizerHash := range descriptor[1:] {
+					rfs.blockPopularity[randomizerHash]++
+				}
+			}
+		}
+	}
 }

@@ -6,68 +6,61 @@ import (
 	"testing"
 )
 
-func TestSelectOptimalBlocks(t *testing.T) {
+func TestSelectOptimalBlocks_Hybrid(t *testing.T) {
 	analyzer := &ContentAnalyzer{}
 	blockSize := 1024
+	minEntropy := 6.5 // A threshold for this test
 
-	// Candidate 1: Low entropy (all zeros)
+	// Candidate 1: Low entropy, high popularity (should be ignored due to low entropy)
 	lowEntropyBlock := make([]byte, blockSize)
-	candidateLow := BlockCandidate{Hash: "low", Data: lowEntropyBlock}
+	candidateLow := BlockCandidate{Hash: "low", Data: lowEntropyBlock, Popularity: 100}
 
-	// Candidate 2: High entropy (random data)
-	highEntropyBlock := make([]byte, blockSize)
-	_, err := rand.Read(highEntropyBlock)
-	if err != nil {
-		t.Fatalf("Failed to generate random data: %v", err)
-	}
-	candidateHigh := BlockCandidate{Hash: "high", Data: highEntropyBlock}
+	// Candidate 2: High entropy, low popularity
+	highEntropyBlock1 := make([]byte, blockSize)
+	_, _ = rand.Read(highEntropyBlock1)
+	candidateHigh1 := BlockCandidate{Hash: "high1", Data: highEntropyBlock1, Popularity: 5}
 
-	// Candidate 3: Medium entropy (repeated pattern)
-	mediumEntropyBlock := bytes.Repeat([]byte{0xDE, 0xAD, 0xBE, 0xEF}, blockSize/4)
-	candidateMedium := BlockCandidate{Hash: "medium", Data: mediumEntropyBlock}
+	// Candidate 3: High entropy, high popularity (should be chosen first)
+	highEntropyBlock2 := make([]byte, blockSize)
+	_, _ = rand.Read(highEntropyBlock2)
+	candidateHigh2 := BlockCandidate{Hash: "high2", Data: highEntropyBlock2, Popularity: 50}
 
-	candidates := []BlockCandidate{candidateLow, candidateHigh, candidateMedium}
+	// Candidate 4: High entropy, medium popularity (should be chosen second)
+	highEntropyBlock3 := make([]byte, blockSize)
+	_, _ = rand.Read(highEntropyBlock3)
+	candidateHigh3 := BlockCandidate{Hash: "high3", Data: highEntropyBlock3, Popularity: 20}
 
-	// Test selecting the single best block
-	t.Run("SelectBest_1", func(t *testing.T) {
-		selected := analyzer.selectOptimalBlocks(candidates, 1)
-		if len(selected) != 1 {
-			t.Fatalf("Expected 1 block, got %d", len(selected))
-		}
-		if selected[0].Hash != "high" {
-			t.Errorf("Expected block 'high' to be selected for its high entropy, but got '%s'", selected[0].Hash)
-		}
-	})
+	// Candidate 5: Medium entropy, high popularity (should be ignored)
+	mediumEntropyBlock := bytes.Repeat([]byte{0xDE, 0xAD}, blockSize/2)
+	candidateMedium := BlockCandidate{Hash: "medium", Data: mediumEntropyBlock, Popularity: 200}
+
+	candidates := []BlockCandidate{candidateLow, candidateHigh1, candidateHigh2, candidateHigh3, candidateMedium}
 
 	// Test selecting the top two blocks
-	t.Run("SelectBest_2", func(t *testing.T) {
-		selected := analyzer.selectOptimalBlocks(candidates, 2)
+	t.Run("SelectBest_2_Hybrid", func(t *testing.T) {
+		selected := analyzer.selectOptimalBlocks(candidates, 2, minEntropy)
 		if len(selected) != 2 {
 			t.Fatalf("Expected 2 blocks, got %d", len(selected))
 		}
-		if selected[0].Hash != "high" {
-			t.Errorf("Expected first block to be 'high', got '%s'", selected[0].Hash)
+		// Expect the most popular of the high-entropy blocks first
+		if selected[0].Hash != "high2" {
+			t.Errorf("Expected first block to be 'high2' (most popular high-entropy), got '%s'", selected[0].Hash)
 		}
-		if selected[1].Hash != "medium" {
-			t.Errorf("Expected second block to be 'medium', got '%s'", selected[1].Hash)
+		// Expect the second most popular high-entropy block second
+		if selected[1].Hash != "high3" {
+			t.Errorf("Expected second block to be 'high3' (second most popular high-entropy), got '%s'", selected[1].Hash)
 		}
 	})
 
-	// Test entropy calculation sanity check
-	t.Run("EntropyCalculation", func(t *testing.T) {
-		entropyLow := calculateEntropy(candidateLow.Data)
-		entropyMedium := calculateEntropy(candidateMedium.Data)
-		entropyHigh := calculateEntropy(candidateHigh.Data)
-
-		if entropyLow != 0 {
-			t.Errorf("Expected entropy of all zeros to be 0, got %f", entropyLow)
+	t.Run("EntropyFiltering", func(t *testing.T) {
+		selected := analyzer.selectOptimalBlocks(candidates, 5, minEntropy)
+		for _, s := range selected {
+			if s.Hash == "low" || s.Hash == "medium" {
+				t.Errorf("Block '%s' was selected but should have been filtered out due to low entropy", s.Hash)
+			}
 		}
-		if entropyMedium <= entropyLow {
-			t.Errorf("Expected medium entropy (%f) to be greater than low entropy (%f)", entropyMedium, entropyLow)
+		if len(selected) != 3 {
+			t.Errorf("Expected 3 high-entropy blocks to be selected, but got %d", len(selected))
 		}
-		if entropyHigh <= entropyMedium {
-			t.Errorf("Expected high entropy (%f) to be greater than medium entropy (%f)", entropyHigh, entropyMedium)
-		}
-		t.Logf("Entropies: Low=%.2f, Medium=%.2f, High=%.2f", entropyLow, entropyMedium, entropyHigh)
 	})
 }

@@ -12,8 +12,9 @@ type ContentAnalyzer struct {
 
 // BlockCandidate represents a potential block to be used as a randomizer.
 type BlockCandidate struct {
-	Hash string
-	Data []byte
+	Hash       string
+	Data       []byte
+	Popularity int
 }
 
 // ScoredCandidate holds a candidate and its score.
@@ -40,34 +41,34 @@ func calculateEntropy(data []byte) float64 {
 	return entropy
 }
 
-// selectOptimalBlocks scores and selects the best randomizer blocks based on entropy.
-func (ca *ContentAnalyzer) selectOptimalBlocks(candidates []BlockCandidate, count int) []BlockCandidate {
-	if len(candidates) <= count {
-		// Return all candidates if there are not enough to choose from.
-		return candidates
+// selectOptimalBlocks scores and selects the best randomizer blocks based on a hybrid strategy.
+func (ca *ContentAnalyzer) selectOptimalBlocks(candidates []BlockCandidate, count int, minEntropy float64) []BlockCandidate {
+	if len(candidates) == 0 {
+		return []BlockCandidate{}
 	}
 
-	scored := make([]ScoredCandidate, len(candidates))
-
-	for i, candidate := range candidates {
-		score := 0.0
-		candidateEntropy := calculateEntropy(candidate.Data)
-		// Prefer blocks with higher entropy to maximize randomness.
-		// A more advanced strategy could be to match entropy, but maximizing it is a good start.
-		score = candidateEntropy
-
-		scored[i] = ScoredCandidate{candidate, score}
+	// 1. Filter out candidates that don't meet the minimum entropy threshold.
+	highEntropyCandidates := make([]BlockCandidate, 0, len(candidates))
+	for _, c := range candidates {
+		if calculateEntropy(c.Data) >= minEntropy {
+			highEntropyCandidates = append(highEntropyCandidates, c)
+		}
 	}
 
-	// Sort candidates by score descending to get the highest entropy blocks.
-	sort.Slice(scored, func(i, j int) bool {
-		return scored[i].Score > scored[j].Score
+	// If filtering left us with too few candidates, we return what we have,
+	// sorted by popularity.
+	if len(highEntropyCandidates) <= count {
+		sort.Slice(highEntropyCandidates, func(i, j int) bool {
+			return highEntropyCandidates[i].Popularity > highEntropyCandidates[j].Popularity
+		})
+		return highEntropyCandidates
+	}
+
+	// 2. Sort the high-entropy candidates by popularity (descending).
+	sort.Slice(highEntropyCandidates, func(i, j int) bool {
+		return highEntropyCandidates[i].Popularity > highEntropyCandidates[j].Popularity
 	})
 
-	// Select top N candidates
-	topCandidates := make([]BlockCandidate, count)
-	for i := 0; i < count; i++ {
-		topCandidates[i] = scored[i].Candidate
-	}
-	return topCandidates
+	// 3. Return the top N most popular, high-entropy candidates.
+	return highEntropyCandidates[:count]
 }
