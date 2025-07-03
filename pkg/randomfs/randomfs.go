@@ -52,6 +52,7 @@ type RandomFS struct {
 	RedundancyFactor int
 	blockIndex       []string
 	blockIndexMutex  sync.Mutex
+	analyzer         *ContentAnalyzer
 
 	// Statistics
 	stats Stats
@@ -234,6 +235,7 @@ func NewRandomFSWithOptions(ipfsAPI string, dataDir string, cacheSize int64, ski
 		useLocalStorage:  skipIPFSTest,
 		RedundancyFactor: 2, // Default redundancy factor
 		blockIndex:       make([]string, 0),
+		analyzer:         &ContentAnalyzer{},
 	}
 
 	// Load existing block hashes into the index if using local storage
@@ -922,35 +924,57 @@ func splitIntoBlocks(data []byte, blockSize int) [][]byte {
 }
 
 // selectRandomizerBlocks selects existing blocks to be used as randomizers
-// and generates new ones if not enough are available.
+// and generates new ones if not enough are available. It uses a content analyzer
+// to pick the best candidates for reuse.
 func (rfs *RandomFS) selectRandomizerBlocks(count int, blockSize int) (blocks [][]byte, reusedCount int, err error) {
-	hashesToFetch := rfs.selectRandomizerHashes(count)
-	reusedCount = len(hashesToFetch)
+	// 1. Get a pool of candidates from the block index.
+	const maxCandidates = 20 // Analyze up to 20 candidates for performance.
+	candidateHashes := rfs.selectRandomizerHashes(maxCandidates)
 
-	// Fetch the blocks for the reused hashes
-	for _, hash := range hashesToFetch {
-		blockData, err := rfs.retrieveBlock(hash)
-		if err != nil {
-			// If a reused block fails, we could generate a new one instead.
-			// For simplicity, we'll return an error for now.
-			return nil, 0, fmt.Errorf("failed to retrieve reused block %s: %v", hash, err)
+	candidates := make([]BlockCandidate, 0, len(candidateHashes))
+	for _, hash := range candidateHashes {
+		data, err := rfs.retrieveBlock(hash) // This uses the cache, so it should be fast.
+		if err == nil {
+			candidates = append(candidates, BlockCandidate{Hash: hash, Data: data})
 		}
-		blocks = append(blocks, blockData)
 	}
 
-	// Generate new random blocks if we don't have enough
-	for len(blocks) < count {
+	var selectedBlocks [][]byte
+
+	// 2. If we have candidates, use the analyzer to select the best ones.
+	if len(candidates) > 0 {
+		numToSelect := count
+		if len(candidates) < count {
+			numToSelect = len(candidates)
+		}
+		// Note: The original block data is not passed here yet. The current strategy
+		// is to just pick the highest entropy blocks.
+		optimalCandidates := rfs.analyzer.selectOptimalBlocks(candidates, numToSelect)
+		for _, c := range optimalCandidates {
+			selectedBlocks = append(selectedBlocks, c.Data)
+		}
+	}
+
+	reusedCount = len(selectedBlocks)
+	if reusedCount > 0 {
+		rfs.updateStats(func(s *Stats) {
+			s.BlocksReused += int64(reusedCount)
+		})
+	}
+
+	// 3. Generate new random blocks if we don't have enough.
+	for len(selectedBlocks) < count {
 		newBlock := make([]byte, blockSize)
 		if _, err := rand.Read(newBlock); err != nil {
 			return nil, 0, fmt.Errorf("failed to generate new randomizer block: %v", err)
 		}
-		blocks = append(blocks, newBlock)
+		selectedBlocks = append(selectedBlocks, newBlock)
 	}
 
-	return blocks, reusedCount, nil
+	return selectedBlocks, reusedCount, nil
 }
 
-// selectRandomizerHashes randomly selects unique block hashes from the index.
+// selectRandomizerHashes selects a random set of block hashes from the index.
 func (rfs *RandomFS) selectRandomizerHashes(count int) []string {
 	rfs.blockIndexMutex.Lock()
 	defer rfs.blockIndexMutex.Unlock()
@@ -990,4 +1014,11 @@ func (rfs *RandomFS) loadBlockIndex() {
 		}
 	}
 	log.Printf("Loaded %d block hashes into index from local storage.", len(rfs.blockIndex))
+}
+
+// updateStats updates the statistics for the RandomFS instance
+func (rfs *RandomFS) updateStats(updateFunc func(*Stats)) {
+	rfs.stats.mutex.Lock()
+	defer rfs.stats.mutex.Unlock()
+	updateFunc(&rfs.stats)
 }
