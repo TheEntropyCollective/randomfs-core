@@ -92,46 +92,6 @@ func TestEncryption(t *testing.T) {
 	}
 }
 
-func TestRedundancyRecoveryWithEncryption(t *testing.T) {
-	rfs, tempDir, teardown := setupTestFS(t)
-	defer teardown()
-
-	testData := []byte("Data that must be recovered despite a block failure.")
-	repHash, err := rfs.StoreFile("redundant.txt", testData, "text/plain", testPassword)
-	if err != nil {
-		t.Fatalf("Failed to store file for redundancy test: %v", err)
-	}
-
-	// Get the representation so we can find a block to delete
-	encryptedRep, err := rfs.retrieveBlock(repHash)
-	if err != nil {
-		t.Fatalf("Failed to retrieve encrypted representation: %v", err)
-	}
-	rep, err := rfs.getRepresentation(encryptedRep, testPassword)
-	if err != nil {
-		t.Fatalf("Failed to get representation: %v", err)
-	}
-
-	if len(rep.Descriptors) == 0 || len(rep.Descriptors[0]) == 0 || len(rep.Descriptors[0][0]) < 2 {
-		t.Fatal("Test setup error: No randomizer block found to delete")
-	}
-	blockToDelete := rep.Descriptors[0][0][1]
-
-	blockPath := filepath.Join(tempDir, "blocks", blockToDelete)
-	if err := os.Remove(blockPath); err != nil {
-		t.Fatalf("Failed to delete block file %s: %v", blockPath, err)
-	}
-
-	retrievedData, _, err := rfs.RetrieveFile(repHash, testPassword)
-	if err != nil {
-		t.Fatalf("Failed to retrieve file after block deletion: %v", err)
-	}
-
-	if !bytes.Equal(testData, retrievedData) {
-		t.Fatal("Retrieved data after recovery does not match original data")
-	}
-}
-
 func TestCoverTraffic(t *testing.T) {
 	rfs, err := NewRandomFSWithoutIPFS(t.TempDir(), 1000)
 	if err != nil {
@@ -230,4 +190,44 @@ func TestBatchOperations(t *testing.T) {
 	}
 
 	t.Logf("Successfully tested batch operations. File size: %d bytes, Blocks: %d", len(testData), len(rep.Descriptors))
+}
+
+func TestRedundancyRecoveryWithEncryption(t *testing.T) {
+	rfs, tempDir, teardown := setupTestFS(t)
+	defer teardown()
+
+	testData := []byte("Data that must be recovered despite a block failure.")
+	repHash, err := rfs.StoreFile("redundant.txt", testData, "text/plain", testPassword)
+	if err != nil {
+		t.Fatalf("Failed to store file for redundancy test: %v", err)
+	}
+
+	// Get the representation so we can find a block to delete
+	encryptedRep, err := rfs.retrieveBlock(repHash)
+	if err != nil {
+		t.Fatalf("Failed to retrieve encrypted representation: %v", err)
+	}
+	rep, err := rfs.getRepresentation(encryptedRep, testPassword)
+	if err != nil {
+		t.Fatalf("Failed to get representation: %v", err)
+	}
+
+	if len(rep.Descriptors) == 0 || len(rep.Descriptors[0]) == 0 || len(rep.Descriptors[0][0]) < 2 {
+		t.Fatal("Test setup error: No randomizer block found to delete")
+	}
+	blockToDelete := rep.Descriptors[0][0][1]
+
+	blockPath := filepath.Join(tempDir, "blocks", blockToDelete)
+	if err := os.Remove(blockPath); err != nil {
+		t.Fatalf("Failed to delete block file %s: %v", blockPath, err)
+	}
+
+	retrievedData, _, err := rfs.RetrieveFile(repHash, testPassword)
+	if err != nil {
+		t.Fatalf("Failed to retrieve file after block deletion: %v", err)
+	}
+
+	if !bytes.Equal(testData, retrievedData) {
+		t.Fatal("Retrieved data after recovery does not match original data")
+	}
 }

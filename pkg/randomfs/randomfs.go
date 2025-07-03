@@ -11,10 +11,8 @@ import (
 	mrand "math/rand"
 	"mime/multipart"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -32,9 +30,6 @@ const (
 	NanoThreshold = 100 * 1024       // 100KB
 	MiniThreshold = 10 * 1024 * 1024 // 10MB
 
-	// Protocol version
-	ProtocolVersion = "v5"
-
 	// Default IPFS API endpoint
 	DefaultIPFSEndpoint = "http://localhost:5001"
 
@@ -42,11 +37,11 @@ const (
 	// This includes the anonymized block and its randomizer blocks.
 	TupleSize = 3
 
-	// DefaultBlockSize is the standard size for content blocks.
-	DefaultBlockSize = 128 * 1024 // 128 KiB
-
 	// MinEntropyThreshold is the minimum Shannon entropy a block must have to be considered for reuse.
 	MinEntropyThreshold = 7.0
+
+	// ProtocolVersion is for future-proofing only; no legacy support is implemented.
+	ProtocolVersion = "1"
 )
 
 // RandomFS represents the main filesystem instance
@@ -54,9 +49,7 @@ type RandomFS struct {
 	ipfsAPI              string
 	dataDir              string
 	blockCache           *SmartBlockCache
-	mutex                sync.RWMutex
 	useLocalStorage      bool
-	RedundancyFactor     int
 	blockIndex           []string
 	blockIndexMutex      sync.Mutex
 	analyzer             *ContentAnalyzer
@@ -178,32 +171,11 @@ func (sbc *SmartBlockCache) shouldPromote(hash string) bool {
 type FileRepresentation struct {
 	FileName    string       `json:"filename"`
 	FileSize    int64        `json:"filesize"`
-	BlockHashes []string     `json:"block_hashes"`
 	BlockSize   int          `json:"block_size"`
 	Timestamp   int64        `json:"timestamp"`
 	ContentType string       `json:"content_type"`
-	Version     string       `json:"version"`
-	Descriptors [][][]string `json:"descriptors"` // OFF System descriptor lists with redundancy
-}
-
-// RandomURL represents a rfs:// URL for file access
-type RandomURL struct {
-	Scheme    string
-	Host      string
-	Version   string
-	FileName  string
-	FileSize  int64
-	RepHash   string
-	Timestamp int64
-}
-
-// StreamingReader enables reading large files as a stream.
-type StreamingReader struct {
-	rfs        *RandomFS
-	rep        *FileRepresentation
-	position   int64
-	blockCache *lru.Cache // Caches reconstructed original blocks
-	mutex      sync.Mutex
+	Version     string       `json:"version"`     // For future-proofing only; always set to ProtocolVersion
+	Descriptors [][][]string `json:"descriptors"` // OFF System descriptor lists
 }
 
 // NewRandomFS creates a new RandomFS instance
@@ -239,13 +211,12 @@ func NewRandomFSWithOptions(ipfsAPI string, dataDir string, cacheSize int64, ski
 	}
 
 	rfs := &RandomFS{
-		ipfsAPI:          ipfsAPI,
-		dataDir:          dataDir,
-		useLocalStorage:  skipIPFSTest,
-		RedundancyFactor: 2, // Default redundancy factor
-		blockIndex:       make([]string, 0),
-		analyzer:         &ContentAnalyzer{},
-		blockPopularity:  make(map[string]int),
+		ipfsAPI:         ipfsAPI,
+		dataDir:         dataDir,
+		useLocalStorage: skipIPFSTest,
+		blockIndex:      make([]string, 0),
+		analyzer:        &ContentAnalyzer{},
+		blockPopularity: make(map[string]int),
 	}
 
 	// Load existing block hashes into the index if using local storage
@@ -321,7 +292,7 @@ func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string,
 		BlockSize:   blockSize,
 		Timestamp:   time.Now().Unix(),
 		ContentType: contentType,
-		Version:     ProtocolVersion,
+		Version:     ProtocolVersion, // Always set to current version
 		Descriptors: make([][][]string, len(blocks)),
 	}
 
@@ -329,32 +300,30 @@ func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string,
 	var allBlocks [][]byte
 
 	for i, block := range blocks {
-		for j := 0; j < rfs.RedundancyFactor; j++ {
-			// In each redundancy round, we anonymize
-			// the original block with a set of other random blocks.
-			randomizerBlocks, _, err := rfs.selectRandomizerBlocks(TupleSize-1, blockSize)
-			if err != nil {
-				return "", fmt.Errorf("failed to select randomizer blocks for block %d: %v", i, err)
-			}
-
-			// Add randomizer blocks to the batch
-			for _, rBlock := range randomizerBlocks {
-				allBlocks = append(allBlocks, rBlock)
-			}
-
-			// The last block in the tuple is the XOR sum of the original block and the randomizers.
-			// To get the anonymized block, we start with the original data.
-			anonymizedBlock := make([]byte, len(block))
-			copy(anonymizedBlock, block)
-
-			// XOR with all randomizer blocks
-			for _, rBlock := range randomizerBlocks {
-				XORBlocksInPlace(anonymizedBlock, rBlock)
-			}
-
-			// Add anonymized block to the batch
-			allBlocks = append(allBlocks, anonymizedBlock)
+		// Anonymize the original block with a set of other random blocks.
+		randomizerBlocks, _, err := rfs.selectRandomizerBlocks(TupleSize-1, blockSize)
+		if err != nil {
+			return "", fmt.Errorf("failed to select randomizer blocks for block %d: %v", i, err)
 		}
+
+		// Add randomizer blocks to the batch
+		allBlocks = append(allBlocks, randomizerBlocks...)
+
+		// The last block in the tuple is the XOR sum of the original block and the randomizers.
+		anonymizedBlock := make([]byte, len(block))
+		copy(anonymizedBlock, block)
+		for _, rb := range randomizerBlocks {
+			XORBlocksInPlace(anonymizedBlock, rb)
+		}
+		allBlocks = append(allBlocks, anonymizedBlock)
+
+		// Only one descriptor per block (no redundancy)
+		descriptor := make([]string, 0, TupleSize)
+		for range randomizerBlocks {
+			descriptor = append(descriptor, "") // Placeholder, will be filled after storing
+		}
+		descriptor = append(descriptor, "") // Placeholder for anonymized block hash
+		rep.Descriptors[i] = [][]string{descriptor}
 	}
 
 	// Store all blocks in a batch
@@ -363,27 +332,18 @@ func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string,
 		return "", fmt.Errorf("failed to batch store blocks: %v", err)
 	}
 
-	// Build descriptors using the returned hashes
+	// Fill in the descriptor hashes
 	hashIndex := 0
 	for i := range blocks {
-		var blockDescriptors [][]string
-		for j := 0; j < rfs.RedundancyFactor; j++ {
-			var descriptor []string
-
-			// Add randomizer hashes
-			for k := 0; k < TupleSize-1; k++ {
-				descriptor = append(descriptor, allHashes[hashIndex])
-				hashIndex++
-			}
-
-			// Add anonymized hash at the beginning
-			anonymizedHash := allHashes[hashIndex]
-			descriptor = append([]string{anonymizedHash}, descriptor...)
+		descriptor := make([]string, 0, TupleSize)
+		for range make([]struct{}, TupleSize-1) {
+			descriptor = append(descriptor, allHashes[hashIndex])
 			hashIndex++
-
-			blockDescriptors = append(blockDescriptors, descriptor)
 		}
-		rep.Descriptors[i] = blockDescriptors
+		anonymizedHash := allHashes[hashIndex]
+		descriptor = append(descriptor, anonymizedHash)
+		hashIndex++
+		rep.Descriptors[i][0] = descriptor
 	}
 
 	// Encrypt the representation
@@ -403,12 +363,9 @@ func (rfs *RandomFS) StoreFile(filename string, data []byte, contentType string,
 		return "", fmt.Errorf("failed to store encrypted file representation: %v", err)
 	}
 
-	// Update popularity counts for all reused randomizer blocks
-	rfs.updateBlockPopularity(&rep)
-
 	rfs.updateStats(func(s *Stats) {
 		s.FilesStored++
-		s.BlocksGenerated += int64(len(rep.BlockHashes))
+		s.BlocksGenerated += int64(len(rep.Descriptors) * TupleSize)
 		s.TotalSize += rep.FileSize
 	})
 
@@ -439,7 +396,7 @@ func (rfs *RandomFS) RetrieveFile(repHash string, password string) ([]byte, *Fil
 
 	// --- Cover Traffic ---
 	// Fetch decoy blocks concurrently to obfuscate the real block requests.
-	numDecoys := len(rep.Descriptors) * TupleSize // Fetch roughly same number of decoys as real blocks
+	numDecoys := len(rep.Descriptors) * TupleSize
 	decoyHashes := rfs.selectDecoyBlocks(numDecoys)
 	for _, decoyHash := range decoyHashes {
 		go rfs.retrieveBlock(decoyHash) // We don't care about the result, just the network traffic.
@@ -450,75 +407,72 @@ func (rfs *RandomFS) RetrieveFile(repHash string, password string) ([]byte, *Fil
 		wg.Add(1)
 		go func(blockIndex int) {
 			defer wg.Done()
-			// This logic attempts to reconstruct the block using redundant descriptors
-			// if the primary one fails.
-			for _, descriptor := range rep.Descriptors[blockIndex] {
-				if len(descriptor) == 0 {
-					continue // Should not happen, but good to be safe.
-				}
-				anonymizedHash := descriptor[0]
-				randomizerHashes := descriptor[1:]
 
-				// Fetch all blocks in the tuple concurrently
-				type blockResult struct {
-					isAnonymized bool
-					data         []byte
-					err          error
-				}
-				results := make(chan blockResult, len(descriptor))
-				var fetchWg sync.WaitGroup
-
-				fetchWg.Add(1)
-				go func() {
-					defer fetchWg.Done()
-					data, err := rfs.retrieveBlock(anonymizedHash)
-					results <- blockResult{isAnonymized: true, data: data, err: err}
-				}()
-
-				for _, rHash := range randomizerHashes {
-					fetchWg.Add(1)
-					go func(hash string) {
-						defer fetchWg.Done()
-						data, err := rfs.retrieveBlock(hash)
-						results <- blockResult{isAnonymized: false, data: data, err: err}
-					}(rHash)
-				}
-
-				fetchWg.Wait()
-				close(results)
-
-				var anonymizedBlock []byte
-				randomizerBlocks := make([][]byte, 0, len(randomizerHashes))
-				var fetchErr error
-
-				for res := range results {
-					if res.err != nil {
-						fetchErr = res.err
-						break
-					}
-					if res.isAnonymized {
-						anonymizedBlock = res.data
-					} else {
-						randomizerBlocks = append(randomizerBlocks, res.data)
-					}
-				}
-
-				if fetchErr != nil {
-					log.Printf("Failed to fetch a block for descriptor, trying next one. Error: %v", fetchErr)
-					continue // Try the next redundant descriptor
-				}
-
-				// Reconstruct the original block
-				reconstructedBlock := make([]byte, rep.BlockSize)
-				copy(reconstructedBlock, anonymizedBlock)
-				for _, rBlock := range randomizerBlocks {
-					XORBlocksInPlace(reconstructedBlock, rBlock)
-				}
-				fileData[blockIndex] = reconstructedBlock
-				return // Successfully reconstructed this block, exit the redundancy loop
+			descriptor := rep.Descriptors[blockIndex][0] // Only one descriptor per block
+			if len(descriptor) == 0 {
+				blockErrors <- fmt.Errorf("empty descriptor for block %d", blockIndex)
+				return
 			}
-			// If we get here, all redundant descriptors for this block failed.
-			blockErrors <- fmt.Errorf("failed to reconstruct block %d after all retries", blockIndex)
+
+			anonymizedHash := descriptor[0]
+			randomizerHashes := descriptor[1:]
+
+			// Fetch all blocks in the tuple concurrently
+			type blockResult struct {
+				isAnonymized bool
+				data         []byte
+				err          error
+			}
+			results := make(chan blockResult, len(descriptor))
+			var fetchWg sync.WaitGroup
+
+			fetchWg.Add(1)
+			go func() {
+				defer fetchWg.Done()
+				data, err := rfs.retrieveBlock(anonymizedHash)
+				results <- blockResult{isAnonymized: true, data: data, err: err}
+			}()
+
+			for _, rHash := range randomizerHashes {
+				fetchWg.Add(1)
+				go func(hash string) {
+					defer fetchWg.Done()
+					data, err := rfs.retrieveBlock(hash)
+					results <- blockResult{isAnonymized: false, data: data, err: err}
+				}(rHash)
+			}
+
+			fetchWg.Wait()
+			close(results)
+
+			var anonymizedBlock []byte
+			randomizerBlocks := make([][]byte, 0, len(randomizerHashes))
+			var fetchErr error
+
+			for res := range results {
+				if res.err != nil {
+					fetchErr = res.err
+					break
+				}
+				if res.isAnonymized {
+					anonymizedBlock = res.data
+				} else {
+					randomizerBlocks = append(randomizerBlocks, res.data)
+				}
+			}
+
+			if fetchErr != nil {
+				blockErrors <- fmt.Errorf("failed to fetch blocks for block %d: %v", blockIndex, fetchErr)
+				return
+			}
+
+			// Reconstruct the original block
+			reconstructedBlock := make([]byte, rep.BlockSize)
+			copy(reconstructedBlock, anonymizedBlock)
+			for _, rBlock := range randomizerBlocks {
+				XORBlocksInPlace(reconstructedBlock, rBlock)
+			}
+			fileData[blockIndex] = reconstructedBlock
 		}(i)
 	}
 
@@ -596,92 +550,6 @@ func (rfs *RandomFS) decryptData(encryptedData []byte, password string) ([]byte,
 	}
 
 	return decrypted, nil
-}
-
-// updateBlockPopularity increments the usage count for each randomizer block in a representation.
-func (rfs *RandomFS) updateBlockPopularity(rep *FileRepresentation) {
-	rfs.blockPopularityMutex.Lock()
-	defer rfs.blockPopularityMutex.Unlock()
-
-	for _, descriptorList := range rep.Descriptors {
-		for _, descriptor := range descriptorList {
-			// The first hash is the anonymized block, the rest are randomizers.
-			if len(descriptor) > 1 {
-				for _, randomizerHash := range descriptor[1:] {
-					rfs.blockPopularity[randomizerHash]++
-				}
-			}
-		}
-	}
-}
-
-// GenerateRandomBlocks creates randomized blocks using the OFF System algorithm
-func GenerateRandomBlocks(data []byte, blockSize int) ([][]byte, error) {
-	var blocks [][]byte
-
-	for offset := 0; offset < len(data); offset += blockSize {
-		end := offset + blockSize
-		if end > len(data) {
-			end = len(data)
-		}
-
-		chunk := data[offset:end]
-
-		// Pad chunk to full block size if needed
-		paddedChunk := make([]byte, blockSize)
-		copy(paddedChunk, chunk)
-
-		// Select t-1 randomizer blocks from existing cache or generate new ones
-		randomizers := make([][]byte, TupleSize-1)
-		for i := 0; i < TupleSize-1; i++ {
-			// For now, generate new random blocks
-			// In a real implementation, you'd select from existing cache
-			randomBlock := make([]byte, blockSize)
-			if _, err := rand.Read(randomBlock); err != nil {
-				return nil, fmt.Errorf("failed to generate random data: %v", err)
-			}
-			randomizers[i] = randomBlock
-		}
-
-		// Calculate o_i = s_i ⊕ r_1 ⊕ r_2 ⊕ ... ⊕ r_{t-1}
-		result := make([]byte, blockSize)
-		copy(result, paddedChunk)
-
-		for _, randomizer := range randomizers {
-			XORBlocksInPlace(result, randomizer)
-		}
-
-		// Store the result block
-		blocks = append(blocks, result)
-
-		// Also store the randomizer blocks for reuse
-		blocks = append(blocks, randomizers...)
-	}
-
-	return blocks, nil
-}
-
-// DeRandomizeBlock recovers original data using the OFF System algorithm
-// This function is called for each block in the descriptor set
-func DeRandomizeBlock(block []byte, dataSize int) []byte {
-	// In the OFF System, derandomization happens by XORing all blocks in the tuple
-	// This function is called for each block, but the actual XOR happens in RetrieveFile
-	result := make([]byte, dataSize)
-	copy(result, block[:dataSize])
-	return result
-}
-
-// XORBlocks returns the XOR of two byte slices (up to the length of the shorter slice)
-func XORBlocks(a, b []byte) []byte {
-	minLen := len(a)
-	if len(b) < minLen {
-		minLen = len(b)
-	}
-	out := make([]byte, minLen)
-	for i := 0; i < minLen; i++ {
-		out[i] = a[i] ^ b[i]
-	}
-	return out
 }
 
 // XORBlocksInPlace XORs b into a in place (up to the length of b)
@@ -973,181 +841,6 @@ func (rfs *RandomFS) catFromLocalStorage(hash string, dataType string) ([]byte, 
 	}
 
 	return data, nil
-}
-
-// ParseRandomURL parses a rfs:// URL
-func ParseRandomURL(rawURL string) (*RandomURL, error) {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid URL: %v", err)
-	}
-
-	if u.Scheme != "rfs" {
-		return nil, fmt.Errorf("invalid scheme: expected 'rfs', got '%s'", u.Scheme)
-	}
-
-	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-	if len(parts) != 1 {
-		return nil, fmt.Errorf("invalid rfs:// URL format: expected rfs://<hash>")
-	}
-
-	hash := parts[0]
-
-	return &RandomURL{
-		Scheme:    u.Scheme,
-		Host:      u.Host,
-		Version:   ProtocolVersion,
-		FileName:  "", // Will be retrieved from representation
-		FileSize:  0,  // Will be retrieved from representation
-		RepHash:   hash,
-		Timestamp: 0, // Will be retrieved from representation
-	}, nil
-}
-
-// String returns the string representation of a RandomURL
-func (ru *RandomURL) String() string {
-	return fmt.Sprintf("rfs://%s", ru.RepHash)
-}
-
-// OpenStream opens a streaming reader for a large file.
-// NOTE: This function does not currently support encrypted descriptors.
-func (rfs *RandomFS) OpenStream(repHash string) (*StreamingReader, error) {
-	// Since we don't have the password, we can't decrypt the real representation.
-	// For now, this will fail. A future update could involve passing the password here.
-	encryptedRep, err := rfs.retrieveBlock(repHash)
-	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve representation block for streaming: %v", err)
-	}
-
-	// This call will fail as an empty password is not allowed for decryption.
-	rep, err := rfs.getRepresentation(encryptedRep, "")
-	if err != nil {
-		return nil, fmt.Errorf("cannot open stream without a password for encrypted descriptor: %v", err)
-	}
-
-	cache, _ := lru.New(10) // Cache for reconstructed blocks
-	return &StreamingReader{
-		rfs:        rfs,
-		rep:        &rep,
-		position:   0,
-		blockCache: cache,
-	}, nil
-}
-
-// Read implements the io.Reader interface for StreamingReader.
-func (sr *StreamingReader) Read(p []byte) (n int, err error) {
-	sr.mutex.Lock()
-	defer sr.mutex.Unlock()
-
-	if sr.position >= sr.rep.FileSize {
-		return 0, io.EOF
-	}
-
-	blockIndex := int(sr.position / int64(sr.rep.BlockSize))
-	blockOffset := int(sr.position % int64(sr.rep.BlockSize))
-
-	// Get the reconstructed block, loading if not in cache.
-	originalBlock, err := sr.getBlock(blockIndex)
-	if err != nil {
-		return 0, err
-	}
-
-	// Copy data from the block to the destination buffer 'p'.
-	bytesToCopy := len(originalBlock) - blockOffset
-	if bytesToCopy > len(p) {
-		bytesToCopy = len(p)
-	}
-
-	// Ensure we don't read past the end of the file.
-	if sr.position+int64(bytesToCopy) > sr.rep.FileSize {
-		bytesToCopy = int(sr.rep.FileSize - sr.position)
-	}
-
-	if bytesToCopy <= 0 {
-		return 0, io.EOF
-	}
-
-	copy(p, originalBlock[blockOffset:blockOffset+bytesToCopy])
-
-	sr.position += int64(bytesToCopy)
-
-	// Simple prefetch for the next block.
-	if sr.position < sr.rep.FileSize {
-		nextBlockIndex := int(sr.position / int64(sr.rep.BlockSize))
-		if nextBlockIndex > blockIndex {
-			go sr.getBlock(nextBlockIndex) // Prefetch in the background, errors are ignored.
-		}
-	}
-
-	return bytesToCopy, nil
-}
-
-// getBlock retrieves a single reconstructed block, from cache or by fetching and derandomizing.
-func (sr *StreamingReader) getBlock(blockIndex int) ([]byte, error) {
-	// Check cache first.
-	if cachedBlock, ok := sr.blockCache.Get(blockIndex); ok {
-		return cachedBlock.([]byte), nil
-	}
-
-	// Block not in cache, load it.
-	numOriginalBlocks := (len(sr.rep.BlockHashes) + TupleSize - 1) / TupleSize
-	if blockIndex >= numOriginalBlocks {
-		return nil, io.EOF
-	}
-
-	start := blockIndex * TupleSize
-	end := start + TupleSize
-	if end > len(sr.rep.BlockHashes) {
-		end = len(sr.rep.BlockHashes)
-	}
-
-	tupleHashes := sr.rep.BlockHashes[start:end]
-
-	// Retrieve tuple blocks in parallel.
-	type blockResult struct {
-		idx  int
-		data []byte
-		err  error
-	}
-
-	results := make(chan blockResult, len(tupleHashes))
-	var wg sync.WaitGroup
-
-	for i, hash := range tupleHashes {
-		wg.Add(1)
-		go func(i int, hash string) {
-			defer wg.Done()
-			data, err := sr.rfs.retrieveBlock(hash)
-			results <- blockResult{i, data, err}
-		}(i, hash)
-	}
-
-	wg.Wait()
-	close(results)
-
-	tupleBlocks := make([][]byte, len(tupleHashes))
-	for res := range results {
-		if res.err != nil {
-			return nil, fmt.Errorf("failed to retrieve block %s for tuple %d: %v", tupleHashes[res.idx], blockIndex, res.err)
-		}
-		tupleBlocks[res.idx] = res.data
-	}
-
-	// Reconstruct the original block by XORing.
-	if len(tupleBlocks) == 0 {
-		return nil, fmt.Errorf("no blocks found for tuple %d", blockIndex)
-	}
-	originalBlock := make([]byte, len(tupleBlocks[0]))
-	copy(originalBlock, tupleBlocks[0])
-
-	for i := 1; i < len(tupleBlocks); i++ {
-		XORBlocksInPlace(originalBlock, tupleBlocks[i])
-	}
-
-	// Add to cache.
-	sr.blockCache.Add(blockIndex, originalBlock)
-
-	return originalBlock, nil
 }
 
 // splitIntoBlocks is a helper function to divide data into fixed-size blocks.
