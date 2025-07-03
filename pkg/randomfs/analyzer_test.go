@@ -64,3 +64,62 @@ func TestSelectOptimalBlocks_Hybrid(t *testing.T) {
 		}
 	})
 }
+
+func TestSelectOptimalBlocks_WeightedRandom(t *testing.T) {
+	analyzer := &ContentAnalyzer{}
+	blockSize := 1024
+	minEntropy := 6.5
+
+	// Candidate 1: Low entropy, high popularity (should never be selected)
+	candidateLow := BlockCandidate{Hash: "low", Data: make([]byte, blockSize), Popularity: 500}
+
+	// Candidate 2: High entropy, high popularity (should be selected most often)
+	highEntropyBlock1 := make([]byte, blockSize)
+	_, _ = rand.Read(highEntropyBlock1)
+	candidateHighPop := BlockCandidate{Hash: "high_pop", Data: highEntropyBlock1, Popularity: 50}
+
+	// Candidate 3: High entropy, low popularity (should be selected less often)
+	highEntropyBlock2 := make([]byte, blockSize)
+	_, _ = rand.Read(highEntropyBlock2)
+	candidateLowPop := BlockCandidate{Hash: "low_pop", Data: highEntropyBlock2, Popularity: 5}
+
+	candidates := []BlockCandidate{candidateLow, candidateHighPop, candidateLowPop}
+
+	// Run the selection many times to check the distribution
+	selectionCounts := make(map[string]int)
+	iterations := 1000
+	for i := 0; i < iterations; i++ {
+		selected := analyzer.selectOptimalBlocks(candidates, 1, minEntropy)
+		if len(selected) > 0 {
+			selectionCounts[selected[0].Hash]++
+		}
+	}
+
+	// 1. Check that the low entropy block was never selected
+	if count, ok := selectionCounts["low"]; ok {
+		t.Errorf("Low entropy block was selected %d times, expected 0", count)
+	}
+
+	// 2. Check that the high-popularity block was selected more than the low-popularity one
+	highPopCount := selectionCounts["high_pop"]
+	lowPopCount := selectionCounts["low_pop"]
+
+	if highPopCount <= lowPopCount {
+		t.Errorf("Expected high-popularity block to be selected more often, but got high_pop: %d, low_pop: %d", highPopCount, lowPopCount)
+	}
+
+	// 3. Check that the distribution is reasonable
+	// The weights are (50+1) vs (5+1) = 51 vs 6. Expected ratio is ~8.5 : 1
+	// We'll check for a ratio of at least 3:1 to avoid flaky tests.
+	if highPopCount < lowPopCount*3 {
+		t.Errorf("Selection distribution is skewed. Expected high_pop to be selected at least 3x more than low_pop, but got high_pop: %d, low_pop: %d", highPopCount, lowPopCount)
+	}
+
+	// 4. Check that only high-entropy blocks were selected
+	totalSelections := highPopCount + lowPopCount
+	if totalSelections != iterations {
+		t.Errorf("Expected %d total selections of high-entropy blocks, but got %d", iterations, totalSelections)
+	}
+
+	t.Logf("Selection distribution after %d iterations: high_pop=%d, low_pop=%d", iterations, highPopCount, lowPopCount)
+}

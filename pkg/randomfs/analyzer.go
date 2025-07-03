@@ -2,8 +2,13 @@ package randomfs
 
 import (
 	"math"
-	"sort"
+	"math/rand"
+	"time"
 )
+
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
 
 // ContentAnalyzer provides tools for selecting optimal blocks.
 type ContentAnalyzer struct {
@@ -42,6 +47,7 @@ func calculateEntropy(data []byte) float64 {
 }
 
 // selectOptimalBlocks scores and selects the best randomizer blocks based on a hybrid strategy.
+// It uses weighted random selection to introduce unpredictability.
 func (ca *ContentAnalyzer) selectOptimalBlocks(candidates []BlockCandidate, count int, minEntropy float64) []BlockCandidate {
 	if len(candidates) == 0 {
 		return []BlockCandidate{}
@@ -55,20 +61,46 @@ func (ca *ContentAnalyzer) selectOptimalBlocks(candidates []BlockCandidate, coun
 		}
 	}
 
-	// If filtering left us with too few candidates, we return what we have,
-	// sorted by popularity.
+	// If filtering left us with too few candidates, we can't do a weighted selection.
+	// We'll just return what we have (up to the requested count).
 	if len(highEntropyCandidates) <= count {
-		sort.Slice(highEntropyCandidates, func(i, j int) bool {
-			return highEntropyCandidates[i].Popularity > highEntropyCandidates[j].Popularity
-		})
 		return highEntropyCandidates
 	}
 
-	// 2. Sort the high-entropy candidates by popularity (descending).
-	sort.Slice(highEntropyCandidates, func(i, j int) bool {
-		return highEntropyCandidates[i].Popularity > highEntropyCandidates[j].Popularity
-	})
+	// 2. Perform weighted random selection without replacement.
+	selectedBlocks := make([]BlockCandidate, 0, count)
+	for i := 0; i < count; i++ {
+		// Calculate total popularity weight of remaining candidates
+		totalWeight := 0
+		for _, c := range highEntropyCandidates {
+			// Add 1 to popularity to ensure even unpopular blocks have a chance.
+			totalWeight += c.Popularity + 1
+		}
 
-	// 3. Return the top N most popular, high-entropy candidates.
-	return highEntropyCandidates[:count]
+		if totalWeight == 0 {
+			// This case should be rare, but if all remaining candidates have 0 popularity,
+			// we fall back to a simple random selection from the high-entropy pool.
+			idx := rand.Intn(len(highEntropyCandidates))
+			selectedBlocks = append(selectedBlocks, highEntropyCandidates[idx])
+			// Remove selected element
+			highEntropyCandidates = append(highEntropyCandidates[:idx], highEntropyCandidates[idx+1:]...)
+			continue
+		}
+
+		// Choose a random number within the total weight
+		r := rand.Intn(totalWeight)
+
+		// Find the candidate corresponding to the random number
+		for j, c := range highEntropyCandidates {
+			r -= (c.Popularity + 1)
+			if r < 0 {
+				selectedBlocks = append(selectedBlocks, c)
+				// Remove the selected candidate for the next round (selection without replacement)
+				highEntropyCandidates = append(highEntropyCandidates[:j], highEntropyCandidates[j+1:]...)
+				break
+			}
+		}
+	}
+
+	return selectedBlocks
 }
